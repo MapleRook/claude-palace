@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+identity.txt
+*.sqlite3
+*.jsonl
+.active_lock
+chroma/
