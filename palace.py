@@ -1191,7 +1191,8 @@ _FUNCTIONAL_PREDICATES = {
 }
 
 
-def detect_contradictions(entity: str = None, auto_flag: bool = False):
+def detect_contradictions(entity: str = None, auto_flag: bool = False,
+                           include_review: bool = False, limit: int = 50):
     """Find (subject, predicate) pairs the KG currently believes more than
     one distinct value for — two simultaneously-true answers to the same
     question.
@@ -1235,23 +1236,31 @@ def detect_contradictions(entity: str = None, auto_flag: bool = False):
         if len({v["object"] for v in vals}) < 2:
             continue
         vals.sort(key=lambda v: v["created_at"] or "")
+        objs = sorted({v["object"] for v in vals})
+        # Compact by design: the full per-triple `values` arrays were ~63%
+        # of the payload and blew the MCP token limit on the live KG. Keep
+        # the actionable bits (distinct values, ends, a few triple_ids for
+        # supersede) and drop the firehose.
         found.append({
             "subject": subj, "predicate": pred,
             "confidence": "high" if pred in _FUNCTIONAL_PREDICATES else "review",
-            "distinct_values": sorted({v["object"] for v in vals}),
+            "distinct_values": objs[:8],
+            "value_count": len(objs),
             "oldest": vals[0]["object"], "newest": vals[-1]["object"],
-            "values": vals,
+            "triple_ids": [v["triple_id"] for v in vals][:6],
         })
     found.sort(key=lambda x: 0 if x["confidence"] == "high" else 1)
 
+    high = [c for c in found if c["confidence"] == "high"]
+    review = [c for c in found if c["confidence"] == "review"]
+    shown = high + (review if include_review else [])
+
     flagged = 0
     if auto_flag:
-        for c in found:
-            if c["confidence"] != "high":
-                continue
+        for c in high:
             content = (
                 f"KG CONTRADICTION ({c['subject']} -> {c['predicate']}): "
-                f"{len(c['distinct_values'])} values believed true at once: "
+                f"{c['value_count']} values believed true at once: "
                 f"{c['distinct_values']}. Oldest '{c['oldest']}', newest "
                 f"'{c['newest']}'. If single-valued, resolve via "
                 f"palace_kg_supersede(subject='{c['subject']}', predicate="
@@ -1263,8 +1272,15 @@ def detect_contradictions(entity: str = None, auto_flag: bool = False):
                           added_by="contradiction-detector").get("success"):
                 flagged += 1
 
-    return {"groups_checked": len(groups), "contradictions": found,
-            "flagged": flagged, "auto_flag": auto_flag}
+    return {
+        "groups_checked": len(groups),
+        "summary": {"high": len(high), "review": len(review)},
+        "contradictions": shown[:limit],
+        "truncated": len(shown) > limit,
+        "review_hidden": (not include_review),
+        "flagged": flagged,
+        "auto_flag": auto_flag,
+    }
 
 
 # ── Facts-First Capture ──────────────────────────────────────────────────────
@@ -1506,7 +1522,8 @@ if __name__ == "__main__":
         ent = next((a for a in sys.argv[2:] if not a.startswith("-")), None)
         print(f"Scanning KG for contradictions{f' on {ent}' if ent else ''}"
               f"{' (flagging)' if flag else ''}...")
-        r = detect_contradictions(entity=ent, auto_flag=flag)
+        r = detect_contradictions(entity=ent, auto_flag=flag,
+                                  include_review="--review" in sys.argv)
         print(json.dumps(r, indent=2))
 
     elif cmd in ("backfill-confidence", "backfill_confidence"):

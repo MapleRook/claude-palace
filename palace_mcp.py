@@ -130,8 +130,10 @@ def tool_patterns():
 def tool_consolidate(auto_delete: bool = False):
     return consolidate_all(auto_delete=auto_delete)
 
-def tool_contradictions(entity: str = None, auto_flag: bool = False):
-    return detect_contradictions(entity=entity, auto_flag=auto_flag)
+def tool_contradictions(entity: str = None, auto_flag: bool = False,
+                        include_review: bool = False, limit: int = 50):
+    return detect_contradictions(entity=entity, auto_flag=auto_flag,
+                                 include_review=include_review, limit=limit)
 
 def tool_kg_audit(stale_days: int = 30):
     stale = _kg.audit(stale_days=stale_days)
@@ -380,6 +382,8 @@ TOOLS = {
             "properties": {
                 "entity": {"type": "string", "description": "Limit to facts touching this entity (optional; default scans the whole KG)"},
                 "auto_flag": {"type": "boolean", "description": "Write a feedback/kg-contradictions memory for each high-confidence conflict (default: false, report only)"},
+                "include_review": {"type": "boolean", "description": "Include the review tier (possibly-multivalued predicates, often noisy). Default false: only high-confidence conflicts are listed; review is summarized as a count."},
+                "limit": {"type": "integer", "description": "Max contradictions in the list (default 50)"},
             },
         },
         "handler": tool_contradictions,
