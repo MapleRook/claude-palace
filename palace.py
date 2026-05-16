@@ -120,6 +120,8 @@ class KnowledgeGraph:
                 source TEXT,
                 extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 last_verified TEXT,
+                created_at TEXT,
+                invalidated_at TEXT,
                 FOREIGN KEY (subject) REFERENCES entities(id),
                 FOREIGN KEY (object) REFERENCES entities(id)
             );
@@ -127,11 +129,22 @@ class KnowledgeGraph:
             CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object);
             CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate);
         """)
-        # Migration: add last_verified if missing (existing DBs)
-        try:
-            conn.execute("ALTER TABLE triples ADD COLUMN last_verified TEXT")
-        except Exception:
-            pass  # Column already exists
+        # Migrations for existing DBs — each ALTER is a no-op if the column
+        # already exists. Bitemporal model adds transaction-time alongside
+        # the existing valid-time (valid_from/valid_to):
+        #   created_at      — when we recorded this belief (txn-time start)
+        #   invalidated_at  — when we retracted it (txn-time end); NULL = believed
+        for col in ("last_verified TEXT", "created_at TEXT", "invalidated_at TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE triples ADD COLUMN {col}")
+            except Exception:
+                pass  # Column already exists
+        # Backfill created_at from extracted_at for pre-bitemporal rows.
+        conn.execute(
+            "UPDATE triples SET created_at = COALESCE(extracted_at, CURRENT_TIMESTAMP) "
+            "WHERE created_at IS NULL"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_invalidated ON triples(invalidated_at)")
         conn.commit()
         conn.close()
 
@@ -164,97 +177,164 @@ class KnowledgeGraph:
         conn.execute("INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)", (sub_id, subject))
         conn.execute("INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)", (obj_id, obj))
 
-        # Skip if identical active triple exists
+        # Skip if an identical, currently-believed triple exists. A
+        # retracted (invalidated_at) triple does NOT block re-assertion —
+        # re-asserting creates a fresh believed row, preserving the gap.
         existing = conn.execute(
-            "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+            "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? "
+            "AND valid_to IS NULL AND invalidated_at IS NULL",
             (sub_id, pred, obj_id)
         ).fetchone()
         if existing:
             conn.close()
             return existing[0]
 
-        triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.md5(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:8]}"
+        now = datetime.now().isoformat()
+        triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.md5(f'{valid_from}{now}'.encode()).hexdigest()[:8]}"
         conn.execute(
-            "INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to, confidence, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (triple_id, sub_id, pred, obj_id, valid_from, valid_to, confidence, source)
+            "INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to, confidence, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (triple_id, sub_id, pred, obj_id, valid_from, valid_to, confidence, source, now)
         )
         conn.commit()
         conn.close()
         return triple_id
 
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
+    def invalidate(self, subject: str, predicate: str, obj: str,
+                   ended: str = None, retract: bool = False):
+        """End a fact.
+
+        retract=False (default): valid-time end — the fact stopped being
+        true in the world on `ended`. The record is still believed and
+        still answers "what was true as of <date before ended>".
+
+        retract=True: transaction-time retraction — we no longer believe
+        this record (it was wrong / superseded). It is excluded from
+        normal queries but retained so `as_believed` can still answer
+        "what did we believe as of <date before now>".
+        """
         sub_id = self._eid(subject)
         obj_id = self._eid(obj)
         pred = predicate.lower().replace(" ", "_")
-        ended = ended or date.today().isoformat()
         conn = self._conn()
-        conn.execute(
-            "UPDATE triples SET valid_to=? WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
-            (ended, sub_id, pred, obj_id)
-        )
+        if retract:
+            conn.execute(
+                "UPDATE triples SET invalidated_at=? WHERE subject=? AND predicate=? "
+                "AND object=? AND invalidated_at IS NULL",
+                (datetime.now().isoformat(), sub_id, pred, obj_id)
+            )
+        else:
+            ended = ended or date.today().isoformat()
+            conn.execute(
+                "UPDATE triples SET valid_to=? WHERE subject=? AND predicate=? "
+                "AND object=? AND valid_to IS NULL AND invalidated_at IS NULL",
+                (ended, sub_id, pred, obj_id)
+            )
         conn.commit()
         conn.close()
 
-    def query_entity(self, name: str, as_of: str = None, direction: str = "both"):
+    def supersede(self, subject: str, predicate: str, old_obj: str, new_obj: str,
+                  valid_from: str = None, source: str = None):
+        """Replace a fact's object, preserving belief history.
+
+        Retracts the old triple in transaction-time and inserts the new
+        one. The 'decision moved A -> B' primitive: after this, normal
+        queries see only B, but `as_believed=<date before now>` still
+        sees A.
+        """
+        self.invalidate(subject, predicate, old_obj, retract=True)
+        new_id = self.add_triple(
+            subject, predicate, new_obj,
+            valid_from=valid_from or date.today().isoformat(), source=source,
+        )
+        return {
+            "superseded": f"{subject} -> {predicate} -> {old_obj}",
+            "now": f"{subject} -> {predicate} -> {new_obj}",
+            "triple_id": new_id,
+        }
+
+    def query_entity(self, name: str, as_of: str = None, direction: str = "both",
+                     as_believed: str = None):
+        """Query an entity's facts.
+
+        as_of       — valid-time filter: facts true in the world on that date.
+        as_believed — transaction-time filter: facts we believed on that date
+                      (includes facts later retracted). Default (None) returns
+                      only currently-believed facts (invalidated_at IS NULL).
+        """
         eid = self._eid(name)
         conn = self._conn()
         results = []
 
-        if direction in ("outgoing", "both"):
-            query = "SELECT t.*, e.name as obj_name FROM triples t JOIN entities e ON t.object = e.id WHERE t.subject = ?"
-            params = [eid]
+        def _temporal():
+            clause, params = "", []
             if as_of:
-                query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)"
-                params.extend([as_of, as_of])
-            for row in conn.execute(query, params).fetchall():
+                clause += (" AND (t.valid_from IS NULL OR t.valid_from <= ?)"
+                           " AND (t.valid_to IS NULL OR t.valid_to >= ?)")
+                params += [as_of, as_of]
+            if as_believed:
+                clause += (" AND (t.created_at IS NULL OR t.created_at <= ?)"
+                           " AND (t.invalidated_at IS NULL OR t.invalidated_at > ?)")
+                params += [as_believed, as_believed]
+            else:
+                clause += " AND t.invalidated_at IS NULL"
+            return clause, params
+
+        cols = "t.predicate, t.valid_from, t.valid_to, t.confidence, t.invalidated_at, e.name"
+
+        if direction in ("outgoing", "both"):
+            clause, tparams = _temporal()
+            q = (f"SELECT {cols} FROM triples t JOIN entities e ON t.object = e.id "
+                 f"WHERE t.subject = ?{clause}")
+            for pred, vf, vt, conf, inv, oname in conn.execute(q, [eid] + tparams).fetchall():
                 results.append({
-                    "direction": "outgoing",
-                    "subject": name, "predicate": row[2], "object": row[9],
-                    "valid_from": row[4], "valid_to": row[5],
-                    "confidence": row[6], "current": row[5] is None,
+                    "direction": "outgoing", "subject": name,
+                    "predicate": pred, "object": oname,
+                    "valid_from": vf, "valid_to": vt, "confidence": conf,
+                    "current": vt is None, "believed": inv is None,
+                    "retracted_at": inv,
                 })
 
         if direction in ("incoming", "both"):
-            query = "SELECT t.*, e.name as sub_name FROM triples t JOIN entities e ON t.subject = e.id WHERE t.object = ?"
-            params = [eid]
-            if as_of:
-                query += " AND (t.valid_from IS NULL OR t.valid_from <= ?) AND (t.valid_to IS NULL OR t.valid_to >= ?)"
-                params.extend([as_of, as_of])
-            for row in conn.execute(query, params).fetchall():
+            clause, tparams = _temporal()
+            q = (f"SELECT {cols} FROM triples t JOIN entities e ON t.subject = e.id "
+                 f"WHERE t.object = ?{clause}")
+            for pred, vf, vt, conf, inv, sname in conn.execute(q, [eid] + tparams).fetchall():
                 results.append({
-                    "direction": "incoming",
-                    "subject": row[9], "predicate": row[2], "object": name,
-                    "valid_from": row[4], "valid_to": row[5],
-                    "confidence": row[6], "current": row[5] is None,
+                    "direction": "incoming", "subject": sname,
+                    "predicate": pred, "object": name,
+                    "valid_from": vf, "valid_to": vt, "confidence": conf,
+                    "current": vt is None, "believed": inv is None,
+                    "retracted_at": inv,
                 })
 
         conn.close()
         return results
 
     def timeline(self, entity_name: str = None):
+        """Chronological history. Includes retracted facts (flagged
+        believed=False) — a timeline is a history view, not current state."""
         conn = self._conn()
+        cols = ("s.name, t.predicate, o.name, t.valid_from, t.valid_to, "
+                "t.invalidated_at, t.created_at")
+        base = (f"SELECT {cols} FROM triples t "
+                "JOIN entities s ON t.subject = s.id "
+                "JOIN entities o ON t.object = o.id")
         if entity_name:
             eid = self._eid(entity_name)
-            rows = conn.execute("""
-                SELECT t.*, s.name as sub_name, o.name as obj_name
-                FROM triples t
-                JOIN entities s ON t.subject = s.id
-                JOIN entities o ON t.object = o.id
-                WHERE (t.subject = ? OR t.object = ?)
-                ORDER BY t.valid_from ASC NULLS LAST
-            """, (eid, eid)).fetchall()
+            rows = conn.execute(
+                base + " WHERE (t.subject = ? OR t.object = ?) "
+                "ORDER BY t.valid_from ASC NULLS LAST", (eid, eid)
+            ).fetchall()
         else:
-            rows = conn.execute("""
-                SELECT t.*, s.name as sub_name, o.name as obj_name
-                FROM triples t
-                JOIN entities s ON t.subject = s.id
-                JOIN entities o ON t.object = o.id
-                ORDER BY t.valid_from ASC NULLS LAST
-                LIMIT 100
-            """).fetchall()
+            rows = conn.execute(
+                base + " ORDER BY t.valid_from ASC NULLS LAST LIMIT 100"
+            ).fetchall()
         conn.close()
-        return [{"subject": r[9], "predicate": r[2], "object": r[10],
-                 "valid_from": r[4], "valid_to": r[5], "current": r[5] is None} for r in rows]
+        return [{"subject": s, "predicate": p, "object": o,
+                 "valid_from": vf, "valid_to": vt, "current": vt is None,
+                 "believed": inv is None, "retracted_at": inv,
+                 "recorded_at": cre}
+                for s, p, o, vf, vt, inv, cre in rows]
 
     def verify_triple(self, triple_id: str):
         """Mark a triple as verified now."""
@@ -278,6 +358,7 @@ class KnowledgeGraph:
             JOIN entities s ON t.subject = s.id
             JOIN entities o ON t.object = o.id
             WHERE t.valid_to IS NULL
+              AND t.invalidated_at IS NULL
               AND (t.last_verified IS NULL
                    OR julianday(?) - julianday(t.last_verified) > ?)
             ORDER BY t.last_verified ASC NULLS FIRST, t.extracted_at ASC
@@ -294,12 +375,20 @@ class KnowledgeGraph:
         conn = self._conn()
         entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
         triples = conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0]
-        current = conn.execute("SELECT COUNT(*) FROM triples WHERE valid_to IS NULL").fetchone()[0]
-        never_verified = conn.execute("SELECT COUNT(*) FROM triples WHERE valid_to IS NULL AND last_verified IS NULL").fetchone()[0]
+        believed = conn.execute("SELECT COUNT(*) FROM triples WHERE invalidated_at IS NULL").fetchone()[0]
+        retracted = triples - believed
+        current = conn.execute(
+            "SELECT COUNT(*) FROM triples WHERE valid_to IS NULL AND invalidated_at IS NULL"
+        ).fetchone()[0]
+        never_verified = conn.execute(
+            "SELECT COUNT(*) FROM triples WHERE valid_to IS NULL "
+            "AND invalidated_at IS NULL AND last_verified IS NULL"
+        ).fetchone()[0]
         predicates = [r[0] for r in conn.execute("SELECT DISTINCT predicate FROM triples ORDER BY predicate").fetchall()]
         conn.close()
         return {"entities": entities, "triples": triples, "current_facts": current,
-                "expired_facts": triples - current, "never_verified": never_verified,
+                "expired_facts": believed - current, "believed_facts": believed,
+                "retracted_facts": retracted, "never_verified": never_verified,
                 "relationship_types": predicates}
 
 

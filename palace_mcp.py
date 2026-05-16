@@ -6,7 +6,7 @@ palace_mcp.py — MCP server exposing memory palace tools to Claude Code
 Install:
   claude mcp add palace -- python /path/to/claude-palace/palace_mcp.py
 
-Tools (18 total):
+Tools (19 total):
 
   Read:
     palace_status          — overview: memory counts, wings, halls
@@ -19,9 +19,10 @@ Tools (18 total):
     palace_delete          — remove a memory by ID
 
   Knowledge Graph:
-    palace_kg_query        — entity facts with temporal filtering
+    palace_kg_query        — entity facts, bitemporal (as_of / as_believed)
     palace_kg_add          — add a fact (subject → predicate → object)
-    palace_kg_invalidate   — mark a fact as no longer true
+    palace_kg_invalidate   — end a fact (valid-time) or retract it (txn-time)
+    palace_kg_supersede    — replace a fact A→B, keeping belief history
     palace_kg_timeline     — chronological entity story
     palace_kg_stats        — graph overview
 
@@ -71,9 +72,12 @@ def tool_add(wing: str, hall: str, room: str, content: str,
 def tool_delete(memory_id: str):
     return delete_memory(memory_id)
 
-def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
-    results = _kg.query_entity(entity, as_of=as_of, direction=direction)
-    return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
+def tool_kg_query(entity: str, as_of: str = None, direction: str = "both",
+                  as_believed: str = None):
+    results = _kg.query_entity(entity, as_of=as_of, direction=direction,
+                               as_believed=as_believed)
+    return {"entity": entity, "as_of": as_of, "as_believed": as_believed,
+            "facts": results, "count": len(results)}
 
 def tool_kg_add(subject: str, predicate: str, object: str,
                 valid_from: str = None, source: str = None):
@@ -82,10 +86,19 @@ def tool_kg_add(subject: str, predicate: str, object: str,
     return {"success": True, "triple_id": triple_id,
             "fact": f"{subject} -> {predicate} -> {object}"}
 
-def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
-    _kg.invalidate(subject, predicate, object, ended=ended)
+def tool_kg_invalidate(subject: str, predicate: str, object: str,
+                       ended: str = None, retract: bool = False):
+    _kg.invalidate(subject, predicate, object, ended=ended, retract=retract)
+    if retract:
+        return {"success": True, "fact": f"{subject} -> {predicate} -> {object}",
+                "retracted": True, "note": "no longer believed; kept for as_believed history"}
     return {"success": True, "fact": f"{subject} -> {predicate} -> {object}",
             "ended": ended or "today"}
+
+def tool_kg_supersede(subject: str, predicate: str, old_object: str, new_object: str,
+                      valid_from: str = None, source: str = None):
+    return _kg.supersede(subject, predicate, old_object, new_object,
+                         valid_from=valid_from, source=source)
 
 def tool_kg_timeline(entity: str = None):
     results = _kg.timeline(entity)
@@ -219,12 +232,13 @@ TOOLS = {
         "handler": tool_delete,
     },
     "palace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. Use as_of to filter by date.",
+        "description": "Query the knowledge graph for an entity's relationships. Bitemporal: as_of filters valid-time (true in the world on that date); as_believed filters transaction-time (what we believed on that date, including facts later retracted). Default returns only currently-believed facts.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "entity": {"type": "string", "description": "Entity to query (person, project, concept)"},
-                "as_of": {"type": "string", "description": "Date filter YYYY-MM-DD (optional)"},
+                "as_of": {"type": "string", "description": "Valid-time filter YYYY-MM-DD: facts true in the world on that date (optional)"},
+                "as_believed": {"type": "string", "description": "Transaction-time filter YYYY-MM-DD: facts we believed on that date, incl. ones since retracted (optional)"},
                 "direction": {"type": "string", "description": "outgoing, incoming, or both (default: both)"},
             },
             "required": ["entity"],
@@ -247,18 +261,35 @@ TOOLS = {
         "handler": tool_kg_add,
     },
     "palace_kg_invalidate": {
-        "description": "Mark a fact as no longer true (set end date).",
+        "description": "End a fact. Default (retract=false): valid-time end — the fact stopped being true in the world on `ended`, record stays believed. retract=true: transaction-time retraction — the fact was wrong/superseded, excluded from queries but kept for as_believed history.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "subject": {"type": "string"},
                 "predicate": {"type": "string"},
                 "object": {"type": "string"},
-                "ended": {"type": "string", "description": "When it stopped being true YYYY-MM-DD (default: today)"},
+                "ended": {"type": "string", "description": "When it stopped being true YYYY-MM-DD (default: today). Ignored if retract=true."},
+                "retract": {"type": "boolean", "description": "True = we no longer believe this fact (was wrong/superseded), not that the world changed (default: false)"},
             },
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
+    },
+    "palace_kg_supersede": {
+        "description": "Replace a fact's object with a new value, preserving belief history. Retracts the old triple in transaction-time and inserts the new one — the 'decision moved A -> B' primitive. Normal queries then see only B; as_believed before now still sees A.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "predicate": {"type": "string"},
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+                "valid_from": {"type": "string", "description": "When the new value became true YYYY-MM-DD (default: today)"},
+                "source": {"type": "string", "description": "Where this change came from (optional)"},
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+        "handler": tool_kg_supersede,
     },
     "palace_kg_timeline": {
         "description": "Chronological timeline of facts. Optionally filter by entity.",
