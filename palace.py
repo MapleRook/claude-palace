@@ -395,9 +395,29 @@ class KnowledgeGraph:
 # ── Memory Storage (ChromaDB) ─────────────────────────────────────────────────
 
 
+def _derive_confidence(added_by: str = "", room: str = ""):
+    """Map provenance to (confidence, quarantined). Quarantined memories
+    are stored but kept out of default retrieval until promoted.
+
+    - regex digest extracts        -> 0.3, quarantined (lowest trust)
+    - speculative custodian fill   -> 0.5, quarantined (the audit's
+      main dilution concern: expander/structurer/pattern-detector)
+    - contradiction flags          -> 0.6, visible (you want to see these)
+    - claude/migration/onboard/etc -> 1.0, trusted
+    """
+    ab, rm = (added_by or "").lower(), (room or "").lower()
+    if rm == "digest-unverified" or ab == "digest-hook":
+        return 0.3, True
+    if ab in ("expander", "structurer", "pattern-detector"):
+        return 0.5, True
+    if ab == "contradiction-detector":
+        return 0.6, False
+    return 1.0, False
+
+
 def add_memory(wing: str, hall: str, room: str, content: str,
                source_file: str = None, added_by: str = "claude",
-               drawer: str = None):
+               drawer: str = None, confidence: float = None):
     col = _get_collection(create=True)
     wing = canonicalize_wing(wing)
 
@@ -410,6 +430,11 @@ def add_memory(wing: str, hall: str, room: str, content: str,
     except Exception:
         pass
 
+    if confidence is None:
+        confidence, quarantined = _derive_confidence(added_by, room)
+    else:
+        quarantined = confidence < 0.5
+
     drawer_id = f"mem_{wing}_{room}_{hashlib.md5((content[:100] + datetime.now().isoformat()).encode()).hexdigest()[:16]}"
     meta = {
         "wing": wing, "hall": hall, "room": room,
@@ -417,11 +442,14 @@ def add_memory(wing: str, hall: str, room: str, content: str,
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
         "date": datetime.now().strftime("%Y-%m-%d"),
+        "confidence": confidence,
+        "quarantined": quarantined,
     }
     if drawer:
         meta["drawer"] = drawer
     col.add(ids=[drawer_id], documents=[content], metadatas=[meta])
-    return {"success": True, "id": drawer_id, "wing": wing, "hall": hall, "room": room,
+    return {"success": True, "id": drawer_id, "wing": wing, "hall": hall,
+            "room": room, "confidence": confidence, "quarantined": quarantined,
             **({"drawer": drawer} if drawer else {})}
 
 
@@ -437,7 +465,8 @@ def delete_memory(memory_id: str):
 
 
 def search_memories(query: str, wing: str = None, hall: str = None,
-                    room: str = None, drawer: str = None, n_results: int = 5):
+                    room: str = None, drawer: str = None, n_results: int = 5,
+                    include_quarantined: bool = False):
     col = _get_collection()
     if not col:
         return {"error": "No palace found", "results": []}
@@ -451,6 +480,8 @@ def search_memories(query: str, wing: str = None, hall: str = None,
         where_clauses.append({"room": room})
     if drawer:
         where_clauses.append({"drawer": drawer})
+    if not include_quarantined:
+        where_clauses.append({"quarantined": False})
 
     where = None
     if len(where_clauses) > 1:
@@ -477,6 +508,7 @@ def search_memories(query: str, wing: str = None, hall: str = None,
             "source_file": Path(meta.get("source_file", "")).name if meta.get("source_file") else "",
             "similarity": round(1 - dist, 3),
             "date": meta.get("date", ""),
+            "confidence": meta.get("confidence", 1.0),
         })
     return {"query": query, "results": hits}
 
@@ -488,7 +520,7 @@ class MemoryStack:
     def __init__(self):
         self.palace_path = PALACE_DB
 
-    def wake_up(self, wing: str = None) -> str:
+    def wake_up(self, wing: str = None, include_quarantined: bool = False) -> str:
         """L0 (identity) + L1 (essential facts). ~200-600 tokens."""
         parts = []
 
@@ -503,8 +535,15 @@ class MemoryStack:
         col = _get_collection()
         if col:
             kwargs = {"include": ["documents", "metadatas"]}
+            wcl = []
             if wing:
-                kwargs["where"] = {"wing": canonicalize_wing(wing)}
+                wcl.append({"wing": canonicalize_wing(wing)})
+            if not include_quarantined:
+                wcl.append({"quarantined": False})
+            if len(wcl) > 1:
+                kwargs["where"] = {"$and": wcl}
+            elif wcl:
+                kwargs["where"] = wcl[0]
             try:
                 results = col.get(**kwargs)
                 docs = results.get("documents", [])
@@ -533,7 +572,8 @@ class MemoryStack:
 
         return "\n".join(parts)
 
-    def recall(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
+    def recall(self, wing: str = None, room: str = None, n_results: int = 10,
+               include_quarantined: bool = False) -> str:
         """L2: On-demand retrieval by wing/room."""
         col = _get_collection()
         if not col:
@@ -544,6 +584,8 @@ class MemoryStack:
             where_clauses.append({"wing": canonicalize_wing(wing)})
         if room:
             where_clauses.append({"room": room})
+        if not include_quarantined:
+            where_clauses.append({"quarantined": False})
 
         where = None
         if len(where_clauses) > 1:
@@ -575,9 +617,11 @@ class MemoryStack:
             lines.append(f"  [{hall}/{room_name}] {snippet}")
         return "\n".join(lines)
 
-    def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
+    def search(self, query: str, wing: str = None, room: str = None,
+               n_results: int = 5, include_quarantined: bool = False) -> str:
         """L3: Deep semantic search."""
-        result = search_memories(query, wing=wing, room=room, n_results=n_results)
+        result = search_memories(query, wing=wing, room=room, n_results=n_results,
+                                 include_quarantined=include_quarantined)
         if result.get("error"):
             return result["error"]
         if not result["results"]:
@@ -1205,6 +1249,64 @@ def detect_contradictions(entity: str = None, auto_flag: bool = False):
             "flagged": flagged, "auto_flag": auto_flag}
 
 
+# ── Confidence / Quarantine ──────────────────────────────────────────────────
+
+
+def backfill_confidence(dry_run: bool = True):
+    """Stamp confidence + quarantined on memories that predate the field,
+    derived from provenance. Required before the quarantine filter works:
+    Chroma metadata predicates only match records that HAVE the key, so a
+    record with no `quarantined` would be invisible to default retrieval
+    until backfilled. Metadata-only rewrite; dry-run by default.
+    """
+    col = _get_collection()
+    if not col:
+        return {"error": "No palace found"}
+
+    data = col.get(include=["metadatas"])
+    ids, metas = data.get("ids", []), data.get("metadatas", [])
+    upd_ids, upd_metas = [], []
+    tiers = defaultdict(int)
+    for mid, m in zip(ids, metas):
+        conf, q = _derive_confidence(m.get("added_by", ""), m.get("room", ""))
+        tiers[f"{conf}{'/q' if q else ''}"] += 1
+        if m.get("confidence") != conf or m.get("quarantined") != q:
+            nm = dict(m)
+            nm["confidence"], nm["quarantined"] = conf, q
+            upd_ids.append(mid)
+            upd_metas.append(nm)
+
+    report = {"total": len(ids), "to_rewrite": len(upd_ids),
+              "tier_distribution": dict(tiers), "applied": False}
+    if dry_run or not upd_ids:
+        return report
+    for i in range(0, len(upd_ids), 200):
+        col.update(ids=upd_ids[i:i + 200], metadatas=upd_metas[i:i + 200])
+    report["applied"] = True
+    return report
+
+
+def promote_memory(memory_id: str, confidence: float = 1.0):
+    """Lift a quarantined memory into first-class retrieval (verified
+    good). The reverse of quarantine — the explicit promotion path."""
+    col = _get_collection()
+    if not col:
+        return {"success": False, "error": "No palace found"}
+    got = col.get(ids=[memory_id], include=["metadatas"])
+    if not got.get("ids"):
+        return {"success": False, "error": f"Not found: {memory_id}"}
+    meta = dict(got["metadatas"][0])
+    was = {"confidence": meta.get("confidence"), "quarantined": meta.get("quarantined")}
+    meta["confidence"] = confidence
+    meta["quarantined"] = confidence < 0.5
+    prev = meta.get("added_by", "")
+    if "promoted" not in prev:
+        meta["added_by"] = (prev + "+promoted").lstrip("+")
+    col.update(ids=[memory_id], metadatas=[meta])
+    return {"success": True, "id": memory_id, "was": was,
+            "now": {"confidence": confidence, "quarantined": meta["quarantined"]}}
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1221,6 +1323,8 @@ if __name__ == "__main__":
         print("  python palace.py consolidate [--auto]     Find/remove duplicates")
         print("  python palace.py merge-wings [--apply]    Collapse wing-name fragments")
         print("  python palace.py contradictions [--flag] [entity]  KG conflicting facts")
+        print("  python palace.py backfill-confidence [--apply] Stamp confidence/quarantine")
+        print("  python palace.py promote <memory_id> [conf]   Un-quarantine a memory")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1282,6 +1386,19 @@ if __name__ == "__main__":
               f"{' (flagging)' if flag else ''}...")
         r = detect_contradictions(entity=ent, auto_flag=flag)
         print(json.dumps(r, indent=2))
+
+    elif cmd in ("backfill-confidence", "backfill_confidence"):
+        apply = "--apply" in sys.argv
+        print(f"Backfilling confidence{' (APPLYING)' if apply else ' (dry run)'}...")
+        print(json.dumps(backfill_confidence(dry_run=not apply), indent=2))
+
+    elif cmd == "promote":
+        if len(sys.argv) < 3:
+            print("Usage: python palace.py promote <memory_id> [confidence]")
+            sys.exit(1)
+        mid = sys.argv[2]
+        conf = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+        print(json.dumps(promote_memory(mid, confidence=conf), indent=2))
 
     else:
         print(f"Unknown command: {cmd}")

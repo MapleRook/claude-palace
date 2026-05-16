@@ -6,7 +6,7 @@ palace_mcp.py — MCP server exposing memory palace tools to Claude Code
 Install:
   claude mcp add palace -- python /path/to/claude-palace/palace_mcp.py
 
-Tools (20 total):
+Tools (21 total):
 
   Read:
     palace_status          — overview: memory counts, wings, halls
@@ -15,8 +15,9 @@ Tools (20 total):
     palace_wake_up         — L0+L1 context for session start
 
   Write:
-    palace_add             — store a memory (with duplicate check)
+    palace_add             — store a memory (confidence-scored, dup-checked)
     palace_delete          — remove a memory by ID
+    palace_promote         — un-quarantine a verified-good memory
 
   Knowledge Graph:
     palace_kg_query        — entity facts, bitemporal (as_of / as_believed)
@@ -42,7 +43,7 @@ from palace import (
     add_memory, delete_memory, search_memories,
     migrate_existing_memories, onboard_project,
     detect_cross_project_patterns, consolidate_all,
-    detect_contradictions,
+    detect_contradictions, promote_memory,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
@@ -57,21 +58,30 @@ _stack = MemoryStack()
 def tool_status():
     return _stack.status()
 
-def tool_search(query: str, limit: int = 5, wing: str = None, hall: str = None, room: str = None, drawer: str = None):
-    return search_memories(query, wing=wing, hall=hall, room=room, drawer=drawer, n_results=limit)
+def tool_search(query: str, limit: int = 5, wing: str = None, hall: str = None,
+                room: str = None, drawer: str = None, include_quarantined: bool = False):
+    return search_memories(query, wing=wing, hall=hall, room=room, drawer=drawer,
+                           n_results=limit, include_quarantined=include_quarantined)
 
-def tool_recall(wing: str = None, room: str = None, n_results: int = 10):
-    return {"text": _stack.recall(wing=wing, room=room, n_results=n_results)}
+def tool_recall(wing: str = None, room: str = None, n_results: int = 10,
+                include_quarantined: bool = False):
+    return {"text": _stack.recall(wing=wing, room=room, n_results=n_results,
+                                  include_quarantined=include_quarantined)}
 
-def tool_wake_up(wing: str = None):
-    return {"text": _stack.wake_up(wing=wing)}
+def tool_wake_up(wing: str = None, include_quarantined: bool = False):
+    return {"text": _stack.wake_up(wing=wing, include_quarantined=include_quarantined)}
 
 def tool_add(wing: str, hall: str, room: str, content: str,
-             source_file: str = None, added_by: str = "claude", drawer: str = None):
-    return add_memory(wing, hall, room, content, source_file=source_file, added_by=added_by, drawer=drawer)
+             source_file: str = None, added_by: str = "claude",
+             drawer: str = None, confidence: float = None):
+    return add_memory(wing, hall, room, content, source_file=source_file,
+                       added_by=added_by, drawer=drawer, confidence=confidence)
 
 def tool_delete(memory_id: str):
     return delete_memory(memory_id)
+
+def tool_promote(memory_id: str, confidence: float = 1.0):
+    return promote_memory(memory_id, confidence=confidence)
 
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both",
                   as_believed: str = None):
@@ -180,6 +190,7 @@ TOOLS = {
                 "hall": {"type": "string", "description": "Filter by memory type (user/feedback/project/reference/task_context)"},
                 "room": {"type": "string", "description": "Filter by topic (e.g. 'vertex-ai-search')"},
                 "drawer": {"type": "string", "description": "Filter by sub-topic within room (optional, 4th hierarchy level)"},
+                "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories (digest regex extracts, speculative custodian fill). Default false."},
             },
             "required": ["query"],
         },
@@ -193,6 +204,7 @@ TOOLS = {
                 "wing": {"type": "string", "description": "Project to recall (e.g. 'small-towns-ai')"},
                 "room": {"type": "string", "description": "Topic to recall (e.g. 'alger-county')"},
                 "n_results": {"type": "integer", "description": "Max results (default 10)"},
+                "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories. Default false."},
             },
         },
         "handler": tool_recall,
@@ -203,6 +215,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Optional project focus for wake-up"},
+                "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories. Default false."},
             },
         },
         "handler": tool_wake_up,
@@ -219,6 +232,7 @@ TOOLS = {
                 "source_file": {"type": "string", "description": "Source file path (optional)"},
                 "added_by": {"type": "string", "description": "Who stored this (default: claude)"},
                 "drawer": {"type": "string", "description": "Sub-topic within room (optional, 4th hierarchy level)"},
+                "confidence": {"type": "number", "description": "0.0-1.0 trust. Omit to derive from provenance; <0.5 quarantines (stored but excluded from default retrieval)."},
             },
             "required": ["wing", "hall", "room", "content"],
         },
@@ -234,6 +248,18 @@ TOOLS = {
             "required": ["memory_id"],
         },
         "handler": tool_delete,
+    },
+    "palace_promote": {
+        "description": "Lift a quarantined memory into first-class retrieval (verified good). Reverse of quarantine — use after confirming a low-confidence digest extract or speculative custodian memory is actually correct.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "ID of the memory to promote"},
+                "confidence": {"type": "number", "description": "New confidence 0.0-1.0 (default 1.0)"},
+            },
+            "required": ["memory_id"],
+        },
+        "handler": tool_promote,
     },
     "palace_kg_query": {
         "description": "Query the knowledge graph for an entity's relationships. Bitemporal: as_of filters valid-time (true in the world on that date); as_believed filters transaction-time (what we believed on that date, including facts later retracted). Default returns only currently-believed facts.",
