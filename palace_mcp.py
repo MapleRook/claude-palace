@@ -6,7 +6,7 @@ palace_mcp.py — MCP server exposing memory palace tools to Claude Code
 Install:
   claude mcp add palace -- python /path/to/claude-palace/palace_mcp.py
 
-Tools (19 total):
+Tools (20 total):
 
   Read:
     palace_status          — overview: memory counts, wings, halls
@@ -42,6 +42,7 @@ from palace import (
     add_memory, delete_memory, search_memories,
     migrate_existing_memories, onboard_project,
     detect_cross_project_patterns, consolidate_all,
+    detect_contradictions,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
@@ -118,6 +119,9 @@ def tool_patterns():
 
 def tool_consolidate(auto_delete: bool = False):
     return consolidate_all(auto_delete=auto_delete)
+
+def tool_contradictions(entity: str = None, auto_flag: bool = False):
+    return detect_contradictions(entity=entity, auto_flag=auto_flag)
 
 def tool_kg_audit(stale_days: int = 30):
     stale = _kg.audit(stale_days=stale_days)
@@ -342,6 +346,17 @@ TOOLS = {
             },
         },
         "handler": tool_consolidate,
+    },
+    "palace_contradictions": {
+        "description": "Find (subject, predicate) pairs the knowledge graph currently believes more than one distinct value for — two simultaneously-true answers to the same question. Precise (operates on triples, not prose). Reports; never deletes. high confidence = single-valued predicate (likely a real conflict); review = possibly-multivalued. auto_flag writes a feedback/kg-contradictions memory for high hits. Resolve with palace_kg_supersede.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "Limit to facts touching this entity (optional; default scans the whole KG)"},
+                "auto_flag": {"type": "boolean", "description": "Write a feedback/kg-contradictions memory for each high-confidence conflict (default: false, report only)"},
+            },
+        },
+        "handler": tool_contradictions,
     },
     "palace_kg_audit": {
         "description": "Find stale knowledge graph facts that haven't been verified recently. Returns triples needing re-verification. Use for palace maintenance.",

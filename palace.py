@@ -1115,6 +1115,96 @@ def merge_wings(dry_run: bool = True):
     return report
 
 
+# ── Contradiction Detection ──────────────────────────────────────────────────
+
+# Predicates that are typically single-valued — >1 simultaneously-current
+# object for the same subject is very likely a real contradiction rather
+# than legitimate multi-valued truth (e.g. "uses" can have many objects).
+_FUNCTIONAL_PREDICATES = {
+    "status", "state", "phase", "tier", "plan", "version", "current_version",
+    "uses_stack", "stack", "model", "default_model", "location", "located_at",
+    "owner", "owned_by", "price", "pricing", "decided",
+    "chose", "selected", "primary", "deployed_at", "runs_on", "hosts",
+    "replaced_by", "is_a", "type", "role",
+}
+
+
+def detect_contradictions(entity: str = None, auto_flag: bool = False):
+    """Find (subject, predicate) pairs the KG currently believes more than
+    one distinct value for — two simultaneously-true answers to the same
+    question.
+
+    Operates on triples, not prose: precise by construction, zero false
+    positives. (A regex pass over palace's long multi-topic memories was
+    prototyped and dropped — it could not reach usable precision, which is
+    itself the Sibyl 'don't fake confidence from a weak signal' lesson.)
+
+    Reports — never deletes. Resolve real single-valued ones with
+    palace_kg_supersede; multi-valued predicates surface as 'review'.
+    """
+    kg = KnowledgeGraph()
+    conn = kg._conn()
+    q = """
+        SELECT s.name, t.predicate, o.name, t.valid_from, t.created_at,
+               t.source, t.id
+        FROM triples t
+        JOIN entities s ON t.subject = s.id
+        JOIN entities o ON t.object  = o.id
+        WHERE t.invalidated_at IS NULL AND t.valid_to IS NULL
+    """
+    params = []
+    if entity:
+        eid = kg._eid(entity)
+        q += " AND (s.id = ? OR o.id = ?)"
+        params += [eid, eid]
+    q += " ORDER BY s.name, t.predicate, t.created_at"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+
+    groups = defaultdict(list)
+    for subj, pred, obj, vf, cre, src, tid in rows:
+        groups[(subj, pred)].append({
+            "object": obj, "valid_from": vf, "created_at": cre,
+            "source": src, "triple_id": tid,
+        })
+
+    found = []
+    for (subj, pred), vals in groups.items():
+        if len({v["object"] for v in vals}) < 2:
+            continue
+        vals.sort(key=lambda v: v["created_at"] or "")
+        found.append({
+            "subject": subj, "predicate": pred,
+            "confidence": "high" if pred in _FUNCTIONAL_PREDICATES else "review",
+            "distinct_values": sorted({v["object"] for v in vals}),
+            "oldest": vals[0]["object"], "newest": vals[-1]["object"],
+            "values": vals,
+        })
+    found.sort(key=lambda x: 0 if x["confidence"] == "high" else 1)
+
+    flagged = 0
+    if auto_flag:
+        for c in found:
+            if c["confidence"] != "high":
+                continue
+            content = (
+                f"KG CONTRADICTION ({c['subject']} -> {c['predicate']}): "
+                f"{len(c['distinct_values'])} values believed true at once: "
+                f"{c['distinct_values']}. Oldest '{c['oldest']}', newest "
+                f"'{c['newest']}'. If single-valued, resolve via "
+                f"palace_kg_supersede(subject='{c['subject']}', predicate="
+                f"'{c['predicate']}', old_object=<stale>, new_object="
+                f"'{c['newest']}'). No triple was deleted."
+            )
+            if add_memory(wing="global", hall="feedback",
+                          room="kg-contradictions", content=content,
+                          added_by="contradiction-detector").get("success"):
+                flagged += 1
+
+    return {"groups_checked": len(groups), "contradictions": found,
+            "flagged": flagged, "auto_flag": auto_flag}
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1130,6 +1220,7 @@ if __name__ == "__main__":
         print("  python palace.py patterns                 Detect cross-project patterns")
         print("  python palace.py consolidate [--auto]     Find/remove duplicates")
         print("  python palace.py merge-wings [--apply]    Collapse wing-name fragments")
+        print("  python palace.py contradictions [--flag] [entity]  KG conflicting facts")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1182,6 +1273,14 @@ if __name__ == "__main__":
         apply = "--apply" in sys.argv
         print(f"Merging wing fragments{' (APPLYING)' if apply else ' (dry run)'}...")
         r = merge_wings(dry_run=not apply)
+        print(json.dumps(r, indent=2))
+
+    elif cmd == "contradictions":
+        flag = "--flag" in sys.argv
+        ent = next((a for a in sys.argv[2:] if not a.startswith("-")), None)
+        print(f"Scanning KG for contradictions{f' on {ent}' if ent else ''}"
+              f"{' (flagging)' if flag else ''}...")
+        r = detect_contradictions(entity=ent, auto_flag=flag)
         print(json.dumps(r, indent=2))
 
     else:
