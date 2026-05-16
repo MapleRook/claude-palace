@@ -47,6 +47,33 @@ COLLECTION_NAME = "claude_memories"
 # Our memory types map to halls
 HALLS = ["user", "feedback", "project", "reference", "task_context"]
 
+# Wing-name variants that lost their separators in older digest runs.
+# Keyed by the fully separator-stripped, lowercased form.
+WING_ALIASES = {
+    "villainmonologue": "villain-monologue",
+    "budgetanalysis": "budget-analysis",
+    "paralleldevicesync": "parallel-device-sync",
+    "minecraftclaudeintegration": "minecraft-claude-integration",
+    "mmzerodecoded": "mmzero-decoded",
+}
+
+
+def canonicalize_wing(raw: str) -> str:
+    """Normalize a wing name to one canonical form.
+
+    Pure-formatting differences (case, underscores, spaces, dots, repeated
+    or edge dashes) collapse together. Known separator-stripped variants are
+    mapped explicitly via WING_ALIASES. Idempotent, so it is safe to route
+    every write and query through it.
+    """
+    if not raw:
+        return "unknown"
+    w = re.sub(r"[\s_.]+", "-", raw.strip().lower())
+    w = re.sub(r"-{2,}", "-", w).strip("-")
+    if not w:
+        return "unknown"
+    return WING_ALIASES.get(w.replace("-", ""), w)
+
 
 def _ensure_dirs():
     Path(PALACE_DIR).mkdir(parents=True, exist_ok=True)
@@ -283,6 +310,7 @@ def add_memory(wing: str, hall: str, room: str, content: str,
                source_file: str = None, added_by: str = "claude",
                drawer: str = None):
     col = _get_collection(create=True)
+    wing = canonicalize_wing(wing)
 
     # Duplicate check
     try:
@@ -327,7 +355,7 @@ def search_memories(query: str, wing: str = None, hall: str = None,
 
     where_clauses = []
     if wing:
-        where_clauses.append({"wing": wing})
+        where_clauses.append({"wing": canonicalize_wing(wing)})
     if hall:
         where_clauses.append({"hall": hall})
     if room:
@@ -387,7 +415,7 @@ class MemoryStack:
         if col:
             kwargs = {"include": ["documents", "metadatas"]}
             if wing:
-                kwargs["where"] = {"wing": wing}
+                kwargs["where"] = {"wing": canonicalize_wing(wing)}
             try:
                 results = col.get(**kwargs)
                 docs = results.get("documents", [])
@@ -424,7 +452,7 @@ class MemoryStack:
 
         where_clauses = []
         if wing:
-            where_clauses.append({"wing": wing})
+            where_clauses.append({"wing": canonicalize_wing(wing)})
         if room:
             where_clauses.append({"room": room})
 
@@ -538,13 +566,13 @@ def _infer_wing_from_path(path: str) -> str:
             "C--Claude-Projects1-TicketMachine": "ticket-machine",
             "C--Claude-Projects1-RoadQualityTool": "road-quality",
         }
-        return mappings.get(key, key.lower().replace("c--", "").replace("claude-projects1-", ""))
+        return canonicalize_wing(mappings.get(key, key.replace("c--", "").replace("claude-projects1-", "")))
 
     # Memory-sync paths
     match = re.search(r"memory-sync/projects/([^/]+)", path)
     if match:
         key = match.group(1)
-        return key.lower().replace("c--", "").replace("e--", "").replace("claude-", "").replace("projects1-", "")
+        return canonicalize_wing(key.replace("c--", "").replace("e--", "").replace("claude-", "").replace("projects1-", ""))
 
     # Global memory
     if "memory-sync/global" in path or "/.claude/memory/" in path:
@@ -944,6 +972,60 @@ def consolidate_all(auto_delete: bool = False, similarity_threshold: float = 0.9
     }
 
 
+# ── Wing Merge Migration ─────────────────────────────────────────────────────
+
+
+def merge_wings(dry_run: bool = True):
+    """Collapse wing-name fragments to their canonical form.
+
+    Rewrites ChromaDB memory metadata only — embeddings and documents are
+    untouched (col.update with metadatas alone). Dry-run by default: returns
+    the merge plan without writing anything.
+    """
+    col = _get_collection()
+    if not col:
+        return {"error": "No palace found"}
+
+    data = col.get(include=["metadatas"])
+    ids = data.get("ids", [])
+    metas = data.get("metadatas", [])
+
+    plan = defaultdict(lambda: defaultdict(int))  # canonical -> {original: count}
+    update_ids = []
+    update_metas = []
+    for mid, meta in zip(ids, metas):
+        orig = meta.get("wing", "unknown")
+        canon = canonicalize_wing(orig)
+        plan[canon][orig] += 1
+        if canon != orig:
+            new_meta = dict(meta)
+            new_meta["wing"] = canon
+            update_ids.append(mid)
+            update_metas.append(new_meta)
+
+    merges = {
+        canon: dict(origs)
+        for canon, origs in sorted(plan.items())
+        if len(origs) > 1 or any(o != canon for o in origs)
+    }
+
+    report = {
+        "total_memories": len(ids),
+        "memories_to_rewrite": len(update_ids),
+        "merges": merges,
+        "applied": False,
+    }
+
+    if dry_run or not update_ids:
+        return report
+
+    batch = 200
+    for i in range(0, len(update_ids), batch):
+        col.update(ids=update_ids[i:i + batch], metadatas=update_metas[i:i + batch])
+    report["applied"] = True
+    return report
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -958,6 +1040,7 @@ if __name__ == "__main__":
         print("  python palace.py onboard <dir> [wing]     Auto-scan a project")
         print("  python palace.py patterns                 Detect cross-project patterns")
         print("  python palace.py consolidate [--auto]     Find/remove duplicates")
+        print("  python palace.py merge-wings [--apply]    Collapse wing-name fragments")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1004,6 +1087,12 @@ if __name__ == "__main__":
         auto = "--auto" in sys.argv
         print(f"Consolidating palace{' (auto-delete)' if auto else ' (report only)'}...")
         r = consolidate_all(auto_delete=auto)
+        print(json.dumps(r, indent=2))
+
+    elif cmd in ("merge-wings", "merge_wings"):
+        apply = "--apply" in sys.argv
+        print(f"Merging wing fragments{' (APPLYING)' if apply else ' (dry run)'}...")
+        r = merge_wings(dry_run=not apply)
         print(json.dumps(r, indent=2))
 
     else:

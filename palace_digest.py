@@ -44,7 +44,7 @@ def detect_wing_from_cwd(cwd: str) -> str:
         "musicmanagement": "music-management",
         "semanticsearch": "semantic-search",
         "sidehustle": "side-hustle",
-        "contractordraft": "side-hustle",
+        "contractordraft": "contractor-draft",
         "ticketmachine": "ticket-machine",
         "roadquality": "road-quality",
         "ac7_decoded": "code-ac7-decoded",
@@ -150,8 +150,8 @@ def extract_discoveries(transcript_text: str, wing: str) -> list:
             matches = re.findall(regex, transcript_text, re.IGNORECASE)
             for match in matches[:3]:  # Cap at 3 per pattern to avoid noise
                 content = match.strip()
-                # Skip if too short or looks like code
-                if len(content) < 30 or content.count("{") > 2:
+                # Skip fragments: too short, too few words, or code-like
+                if len(content) < 40 or len(content.split()) < 5 or content.count("{") > 2:
                     continue
                 discoveries.append({
                     "hall": hall,
@@ -178,7 +178,7 @@ def session_used_palace(transcript_text: str) -> bool:
 
 def run_digest(hook_input: dict):
     """Main digest logic."""
-    from palace import add_memory, _get_collection
+    from palace import add_memory, canonicalize_wing
 
     transcript_path = hook_input.get("transcript_path", "")
     cwd = hook_input.get("cwd", "")
@@ -188,65 +188,46 @@ def run_digest(hook_input: dict):
     if not transcript_path or not os.path.exists(transcript_path):
         return
 
-    wing = detect_wing_from_cwd(cwd)
+    wing = canonicalize_wing(detect_wing_from_cwd(cwd))
     transcript_text = extract_last_n_messages(transcript_path)
 
     if not transcript_text or len(transcript_text) < 100:
         return
 
-    # Check if Claude already stored memories this session
-    already_saved = session_used_palace(transcript_text)
+    # If Claude used palace tools this session it already curated the
+    # memories worth keeping. Regex extraction on top of a curated session
+    # only adds noise — skip entirely.
+    if session_used_palace(transcript_text):
+        return
 
-    # Extract discoveries via pattern matching
-    # Be more aggressive if Claude forgot to use palace tools
+    # Claude saved nothing. Fall back to regex extraction, but file it as
+    # unverified so it never pollutes first-class rooms. A custodian or a
+    # later session can promote anything that turns out to matter.
     discoveries = extract_discoveries(transcript_text, wing)
-
-    # If Claude didn't save anything and session was substantial, widen extraction
-    if not already_saved and len(transcript_text) > 1000:
-        # Read more of the transcript for broader extraction
-        wider_text = extract_last_n_messages(transcript_path, n=80)
-        wider_discoveries = extract_discoveries(wider_text, wing)
-        # Merge, dedup by content
+    if len(transcript_text) > 1000:
+        wider = extract_discoveries(extract_last_n_messages(transcript_path, n=80), wing)
         seen = {d["content"] for d in discoveries}
-        for wd in wider_discoveries:
+        for wd in wider:
             if wd["content"] not in seen:
                 discoveries.append(wd)
                 seen.add(wd["content"])
-        print(f"Palace digest: Claude didn't use palace tools — running wider extraction ({len(discoveries)} candidates)", file=sys.stderr)
 
     stored = 0
     for disc in discoveries:
         result = add_memory(
             wing=wing,
             hall=disc["hall"],
-            room=disc["room"],
-            content=disc["content"],
+            room="digest-unverified",
+            content=f"[unverified digest extract] {disc['content']}",
             source_file=f"session:{session_id}",
             added_by="digest-hook",
         )
         if result.get("success"):
             stored += 1
 
-    # Always store a session summary if this is a Stop event and session was substantial
-    if event == "Stop" and len(transcript_text) > 500:
-        # Extract a brief session fingerprint
-        lines = transcript_text.split("\n")
-        user_msgs = [l for l in lines if l.startswith("[user]:")]
-        if len(user_msgs) >= 3:
-            topics = " | ".join([m[7:80].strip() for m in user_msgs[:5]])
-            summary = f"Session {datetime.now().strftime('%Y-%m-%d %H:%M')} — Topics: {topics}"
-            add_memory(
-                wing=wing,
-                hall="project",
-                room="session-log",
-                content=summary,
-                source_file=f"session:{session_id}",
-                added_by="digest-hook",
-            )
-            stored += 1
-
     if stored > 0:
-        print(f"Palace digest: {stored} memories stored for {wing}", file=sys.stderr)
+        print(f"Palace digest: {stored} unverified extracts filed for {wing} "
+              f"(no palace tools used this session)", file=sys.stderr)
 
 
 def main():
