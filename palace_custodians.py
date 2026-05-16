@@ -367,17 +367,11 @@ def _count_recent_linker_failures(wing: str) -> int:
 
 
 def get_all_wings() -> list:
-    """Get list of known wings from palace."""
+    """Get list of known wings from palace (authoritative: collection metadata)."""
     try:
-        from palace import search_memories
-        # Search broadly to find wings
-        results = search_memories(query="project", limit=100)
-        wings = set()
-        for r in results:
-            meta = r.get("metadata", {})
-            if "wing" in meta:
-                wings.add(meta["wing"])
-        return sorted(wings)
+        from palace import MemoryStack
+        wings = MemoryStack().status().get("wings", {})
+        return sorted(w for w in wings if w and w != "unknown")
     except Exception:
         # Fallback: known wings
         return [
