@@ -17,6 +17,7 @@ Usage in settings.json hooks:
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,59 @@ sys.path.insert(0, str(Path(__file__).parent))
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# ── Verified ingestion (E) ────────────────────────────────────────────────────
+# One budget-capped Haiku pass per uncurated session beats regex fragments.
+# Cost is real and per-session — hard-capped, kill-switchable, and it always
+# degrades to the zero-cost regex path on any failure.
+CLAUDE_EXE = Path.home() / ".local" / "bin" / "claude.exe"
+DIGEST_LLM_BUDGET = 0.05  # hard USD cap per session digest call
+DIGEST_LLM_OFF = Path.home() / ".claude" / "palace" / "digest_llm.off"
+_HALLS = {"user", "feedback", "project", "reference", "task_context"}
+
+
+def llm_extract(transcript_text: str):
+    """One budgeted Haiku pass extracting durable memories as JSON.
+    Returns list[{hall,room,content}], or None on any failure/disable so
+    the caller falls back to regex. Cost bounded by --max-budget-usd."""
+    if DIGEST_LLM_OFF.exists() or not CLAUDE_EXE.exists():
+        return None
+    prompt = (
+        "Extract durable cross-session memories from this coding session "
+        "transcript. Output ONLY a JSON array (no prose, no code fences) of "
+        '{"hall","room","content"} objects. hall is one of: user, feedback, '
+        "project, reference, task_context. room is a short kebab-case topic. "
+        "content is ONE specific durable fact, decision, correction, or "
+        "technical detail, stated plainly, no fluff. Skip transient chatter "
+        "and anything not worth recalling next session. Max 6 items. If "
+        "nothing durable, output []\n\n--- TRANSCRIPT ---\n"
+        + transcript_text[:12000]
+    )
+    cmd = [str(CLAUDE_EXE), "--print", "--model", "haiku",
+           "--output-format", "json", "--max-budget-usd", str(DIGEST_LLM_BUDGET),
+           "-p", prompt]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                            encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            return None
+        outer = json.loads(r.stdout.strip())
+        text = (outer.get("result", "") if isinstance(outer, dict) else "").strip()
+        if "[" not in text or "]" not in text:
+            return None
+        arr = json.loads(text[text.find("["): text.rfind("]") + 1])
+        out = []
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            hall = str(it.get("hall", "")).strip()
+            room = str(it.get("room", "")).strip()
+            content = str(it.get("content", "")).strip()
+            if hall in _HALLS and room and len(content) >= 20:
+                out.append({"hall": hall, "room": room[:60], "content": content})
+        return out[:6]
+    except Exception:
+        return None
 
 
 def detect_wing_from_cwd(cwd: str) -> str:
@@ -200,9 +254,25 @@ def run_digest(hook_input: dict):
     if session_used_palace(transcript_text):
         return
 
-    # Claude saved nothing. Fall back to regex extraction, but file it as
-    # unverified so it never pollutes first-class rooms. A custodian or a
-    # later session can promote anything that turns out to matter.
+    # Claude saved nothing. Verified ingestion (E): one budget-capped
+    # Haiku pass extracts durable memories at confidence 0.7 (visible,
+    # better than regex). On any failure/disable, fall back to the
+    # zero-cost regex path, filed quarantined so it never pollutes recall.
+    llm = llm_extract(transcript_text)
+    if llm:
+        stored = 0
+        for d in llm:
+            if add_memory(
+                wing=wing, hall=d["hall"], room=d["room"], content=d["content"],
+                source_file=f"session:{session_id}",
+                added_by="digest-haiku", confidence=0.7,
+            ).get("success"):
+                stored += 1
+        if stored:
+            print(f"Palace digest: {stored} Haiku-verified memories for {wing}",
+                  file=sys.stderr)
+        return
+
     discoveries = extract_discoveries(transcript_text, wing)
     if len(transcript_text) > 1000:
         wider = extract_discoveries(extract_last_n_messages(transcript_path, n=80), wing)
@@ -227,7 +297,7 @@ def run_digest(hook_input: dict):
 
     if stored > 0:
         print(f"Palace digest: {stored} unverified extracts filed for {wing} "
-              f"(no palace tools used this session)", file=sys.stderr)
+              f"(LLM verify unavailable)", file=sys.stderr)
 
 
 def main():
