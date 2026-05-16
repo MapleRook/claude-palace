@@ -417,7 +417,8 @@ def _derive_confidence(added_by: str = "", room: str = ""):
 
 def add_memory(wing: str, hall: str, room: str, content: str,
                source_file: str = None, added_by: str = "claude",
-               drawer: str = None, confidence: float = None):
+               drawer: str = None, confidence: float = None,
+               extract: bool = True):
     col = _get_collection(create=True)
     wing = canonicalize_wing(wing)
 
@@ -448,8 +449,25 @@ def add_memory(wing: str, hall: str, room: str, content: str,
     if drawer:
         meta["drawer"] = drawer
     col.add(ids=[drawer_id], documents=[content], metadatas=[meta])
+
+    # Facts-first: mirror discrete facts into the KG, sourced back to this
+    # memory (the "citation"). Best-effort and gated — never mine the
+    # quarantined regex/speculative tier, and never let KG failure break
+    # the memory write (prose storage is primary).
+    extracted = 0
+    if extract and not quarantined:
+        try:
+            kg = KnowledgeGraph()
+            for f in extract_facts(content, default_subject=wing):
+                kg.add_triple(f["subject"], f["predicate"], f["object"],
+                              confidence=0.8, source=f"mem:{drawer_id}")
+                extracted += 1
+        except Exception:
+            pass
+
     return {"success": True, "id": drawer_id, "wing": wing, "hall": hall,
             "room": room, "confidence": confidence, "quarantined": quarantined,
+            "facts_extracted": extracted,
             **({"drawer": drawer} if drawer else {})}
 
 
@@ -1249,6 +1267,78 @@ def detect_contradictions(entity: str = None, auto_flag: bool = False):
             "flagged": flagged, "auto_flag": auto_flag}
 
 
+# ── Facts-First Capture ──────────────────────────────────────────────────────
+
+# Conservative, high-precision only. Free-prose fact mining is a noise trap
+# (see the contradiction-detector pivot) — better to miss facts than to
+# pollute the KG. Each pattern requires explicit structure; the object is
+# cleaned and length-bounded. subj_grp=None means "use the memory's subject
+# hint" (the wing), used only for self-referential decision/stack patterns.
+# Survivors of full-corpus precision testing. Earlier candidates were
+# dropped after measurement, not guesswork:
+#   - "X uses Y" / "decided Y"  -> garbage subjects/objects
+#   - "X vN" version pattern    -> ~7% precision (matched decomp tokens
+#                                   like "His version 026")
+# Generic prose fact mining does not reach KG-safe precision over a
+# heterogeneous corpus; only cue-guarded structural patterns do. Better
+# to capture few correct facts than pollute the graph (the Sibyl lesson
+# this feature exists to honor). deployed_to objects are guarded to
+# real targets (path/host) by _looks_like_target below.
+_FACT_PATTERNS = [
+    (re.compile(r"\bdeployed (?:to|at|on)\s+([\w:/\\.~+-]{4,60})", re.I),
+     "deployed_to", None, 1),
+    (re.compile(r"(?:\brepo\b|\bremote\b|mirror(?:ed)?(?:\s+at)?|\borigin\b|"
+                r"hosted (?:at|on))[^\n]{0,30}?github\.com/([\w.-]+/[\w.-]+?)"
+                r"(?=[\s.,;:)]|$)", re.I),
+     "repo", None, 1),
+]
+_FACT_OBJ_STOP = {"the", "this", "that", "it", "them", "a", "an", "our",
+                  "your", "their", "its", "these", "those", "now"}
+# Lone common words that are almost always sentence/product fragments
+# ("Cloud Run" -> subject "Run"), not real entities.
+_FACT_SUBJ_STOP = {"run", "cloud", "the", "this", "it", "node", "app",
+                   "api", "web", "data", "test", "prod", "build", "main",
+                   "core", "new", "old", "next", "sync", "file", "set"}
+# Generic deploy targets that carry no information as an object.
+_DEPLOY_OBJ_STOP = {"cloud", "prod", "production", "staging", "local",
+                    "localhost", "here", "there", "disk", "memory", "it"}
+
+
+def extract_facts(content: str, default_subject: str = None):
+    """Pull a small set of high-precision (subject, predicate, object)
+    triples from memory prose. Deterministic, no LLM. Returns a list of
+    dicts; empty when nothing is confidently extractable (the common,
+    acceptable case)."""
+    facts = []
+    seen = set()
+    for rx, pred, sgrp, ogrp in _FACT_PATTERNS:
+        for m in rx.finditer(content):
+            subj = (m.group(sgrp).strip() if sgrp else default_subject)
+            obj = m.group(ogrp).strip().strip(".,;:'\"")
+            if not subj or not obj:
+                continue
+            if obj.lower() in _FACT_OBJ_STOP or len(obj) < 2 or len(obj) > 40:
+                continue
+            if subj.lower() == obj.lower() or subj.lower() in _FACT_SUBJ_STOP:
+                continue
+            if pred == "deployed_to":
+                # Real target = has a path/host delimiter, or is a proper
+                # noun (capitalized, not a common word). Rejects prose
+                # like "deployed to match/land/a different env".
+                looks_target = (any(d in obj for d in "./\\:")
+                                or (obj[:1].isupper()
+                                    and obj.lower() not in _DEPLOY_OBJ_STOP))
+                if obj.lower() in _DEPLOY_OBJ_STOP or not looks_target:
+                    continue
+            key = (subj.lower(), pred, obj.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append({"subject": subj, "predicate": pred,
+                          "object": obj, "source_pattern": pred})
+    return facts
+
+
 # ── Confidence / Quarantine ──────────────────────────────────────────────────
 
 
@@ -1283,6 +1373,37 @@ def backfill_confidence(dry_run: bool = True):
     for i in range(0, len(upd_ids), 200):
         col.update(ids=upd_ids[i:i + 200], metadatas=upd_metas[i:i + 200])
     report["applied"] = True
+    return report
+
+
+def backfill_facts(wing: str = None, dry_run: bool = True):
+    """Run the fact extractor over existing non-quarantined memories and
+    mirror discoveries into the KG, sourced to each memory. Dry-run by
+    default; scope by wing to bound volume. Idempotent — add_triple
+    dedups identical currently-believed triples."""
+    col = _get_collection()
+    if not col:
+        return {"error": "No palace found"}
+    where = {"quarantined": False}
+    if wing:
+        where = {"$and": [{"wing": canonicalize_wing(wing)}, where]}
+    got = col.get(where=where, include=["documents", "metadatas"])
+    ids = got.get("ids", [])
+    plan = []
+    for mid, doc, m in zip(ids, got.get("documents", []), got.get("metadatas", [])):
+        for f in extract_facts(doc, default_subject=m.get("wing")):
+            plan.append({**f, "memory_id": mid})
+
+    report = {"scanned": len(ids), "facts_found": len(plan),
+              "sample": plan[:15], "applied": False}
+    if dry_run or not plan:
+        return report
+    kg = KnowledgeGraph()
+    for f in plan:
+        kg.add_triple(f["subject"], f["predicate"], f["object"],
+                      confidence=0.8, source=f"mem:{f['memory_id']}")
+    report["applied"] = True
+    report["added"] = len(plan)
     return report
 
 
@@ -1325,6 +1446,7 @@ if __name__ == "__main__":
         print("  python palace.py contradictions [--flag] [entity]  KG conflicting facts")
         print("  python palace.py backfill-confidence [--apply] Stamp confidence/quarantine")
         print("  python palace.py promote <memory_id> [conf]   Un-quarantine a memory")
+        print("  python palace.py backfill-facts [--apply] [wing]  Mirror facts to KG")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1399,6 +1521,13 @@ if __name__ == "__main__":
         mid = sys.argv[2]
         conf = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
         print(json.dumps(promote_memory(mid, confidence=conf), indent=2))
+
+    elif cmd in ("backfill-facts", "backfill_facts"):
+        apply = "--apply" in sys.argv
+        w = next((a for a in sys.argv[2:] if not a.startswith("-")), None)
+        print(f"Backfilling facts{f' for {w}' if w else ''}"
+              f"{' (APPLYING)' if apply else ' (dry run)'}...")
+        print(json.dumps(backfill_facts(wing=w, dry_run=not apply), indent=2))
 
     else:
         print(f"Unknown command: {cmd}")
