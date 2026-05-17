@@ -30,10 +30,32 @@ if sys.platform == "win32":
 
 from palace import (
     PALACE_DB, KG_DB, COLLECTION_NAME,
-    _get_collection, _ensure_dirs, add_memory,
+    _get_collection, _ensure_dirs, add_memory, _derive_confidence,
 )
 
 DEFAULT_SYNC_DIR = os.path.expanduser("~/.claude/memory-sync/palace")
+
+
+def _normalize_imported_meta(meta: dict) -> dict:
+    """Fill safe defaults for any missing filter/trust key on imported
+    metadata.
+
+    Import bypasses add_memory and writes the remote export's metadata
+    verbatim via col.add(). A remote that predates a filter key (`current`
+    / `quarantined`) arrives keyless, and Chroma `where` cannot match a
+    record that lacks the key — so it silently vanishes from default
+    retrieval. This is the continuous-leak counterpart to
+    backfill_currency. Never overwrites a present value: the remote's own
+    currency state (e.g. a memory it retired) is authoritative.
+    """
+    m = dict(meta) if meta else {}
+    if "current" not in m:
+        m["current"] = True
+    if "confidence" not in m or "quarantined" not in m:
+        conf, q = _derive_confidence(m.get("added_by", ""), m.get("room", ""))
+        m.setdefault("confidence", conf)
+        m.setdefault("quarantined", q)
+    return m
 
 
 def cmd_export(sync_dir: str = None):
@@ -132,7 +154,7 @@ def cmd_import(sync_dir: str = None):
 
             batch_ids.append(doc_id)
             batch_docs.append(content)
-            batch_metas.append(metadata)
+            batch_metas.append(_normalize_imported_meta(metadata))
             imported += 1
 
             # Batch add every 50

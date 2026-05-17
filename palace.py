@@ -546,6 +546,11 @@ def add_memory(wing: str, hall: str, room: str, content: str,
         "date": datetime.now().strftime("%Y-%m-%d"),
         "confidence": confidence,
         "quarantined": quarantined,
+        # Currency filter key. Always present so Chroma `where` can match
+        # it (absent keys are unmatchable). True = current understanding;
+        # the arbiter flips it to False on retire/supersede. Default reads
+        # gate on {"current": True} once that filter ships.
+        "current": True,
     }
     if drawer:
         meta["drawer"] = drawer
@@ -1498,6 +1503,92 @@ def backfill_confidence(dry_run: bool = True):
     return report
 
 
+def backfill_currency(dry_run: bool = True):
+    """Stamp the currency filter key (`current`) on every memory, and
+    opportunistically repair any record missing the trust keys
+    (`quarantined`/`confidence`) in the same walk.
+
+    Comprehensiveness is a correctness requirement here, not a nicety:
+    Chroma `where` only matches records that HAVE the key, so a record
+    missing `current` becomes invisible to default retrieval the moment
+    the currency filter ships. Safeguards:
+      - FILL missing keys only — never overwrite an existing value. Safe
+        to re-run after retire/supersede land (won't revive a retired
+        memory) and treats a synced remote's currency state as
+        authoritative.
+      - Reconcile enumerated vs col.count(); refuse to apply on a partial
+        view (never rewrite a fraction and call it done).
+      - On apply, re-scan and assert zero keyless records remain. This is
+        the gate the read-path currency filter checks before shipping.
+    Metadata-only rewrite; dry-run by default.
+    """
+    col = _get_collection()
+    if not col:
+        return {"error": "No palace found"}
+
+    total = col.count()
+    data = col.get(include=["metadatas"])
+    ids, metas = data.get("ids", []), data.get("metadatas", [])
+
+    miss_current = miss_quar = miss_conf = 0
+    keyless_by_added_by = defaultdict(int)
+    upd_ids, upd_metas = [], []
+    for mid, m in zip(ids, metas):
+        nm = dict(m)
+        changed = False
+        if "current" not in nm:
+            nm["current"] = True
+            miss_current += 1
+            keyless_by_added_by[nm.get("added_by", "?")] += 1
+            changed = True
+        if "confidence" not in nm or "quarantined" not in nm:
+            conf, q = _derive_confidence(nm.get("added_by", ""), nm.get("room", ""))
+            if "confidence" not in nm:
+                nm["confidence"] = conf
+                miss_conf += 1
+                changed = True
+            if "quarantined" not in nm:
+                nm["quarantined"] = q
+                miss_quar += 1
+                changed = True
+        if changed:
+            upd_ids.append(mid)
+            upd_metas.append(nm)
+
+    reconciled = len(ids) == total
+    report = {
+        "collection_count": total,
+        "enumerated": len(ids),
+        "reconciled": reconciled,
+        "missing_current": miss_current,
+        "missing_quarantined": miss_quar,
+        "missing_confidence": miss_conf,
+        "to_rewrite": len(upd_ids),
+        "keyless_by_added_by": dict(keyless_by_added_by),
+        "applied": False,
+    }
+    if not reconciled:
+        report["error"] = (
+            f"enumeration ({len(ids)}) != collection count ({total}); "
+            f"refusing to apply on a partial view"
+        )
+        return report
+    if dry_run or not upd_ids:
+        return report
+
+    with _chroma_lock():
+        for i in range(0, len(upd_ids), 200):
+            col.update(ids=upd_ids[i:i + 200], metadatas=upd_metas[i:i + 200])
+
+    verify = col.get(include=["metadatas"])
+    still_keyless = sum(1 for mm in verify.get("metadatas", [])
+                        if "current" not in mm)
+    report["applied"] = True
+    report["post_apply_keyless_current"] = still_keyless
+    report["verified_zero_keyless"] = still_keyless == 0
+    return report
+
+
 def backfill_facts(wing: str = None, dry_run: bool = True):
     """Run the fact extractor over existing non-quarantined memories and
     mirror discoveries into the KG, sourced to each memory. Dry-run by
@@ -1568,6 +1659,7 @@ if __name__ == "__main__":
         print("  python palace.py merge-wings [--apply]    Collapse wing-name fragments")
         print("  python palace.py contradictions [--flag] [entity]  KG conflicting facts")
         print("  python palace.py backfill-confidence [--apply] Stamp confidence/quarantine")
+        print("  python palace.py backfill-currency [--apply]  Stamp `current` + repair keyless")
         print("  python palace.py promote <memory_id> [conf]   Un-quarantine a memory")
         print("  python palace.py backfill-facts [--apply] [wing]  Mirror facts to KG")
         sys.exit(0)
@@ -1637,6 +1729,11 @@ if __name__ == "__main__":
         apply = "--apply" in sys.argv
         print(f"Backfilling confidence{' (APPLYING)' if apply else ' (dry run)'}...")
         print(json.dumps(backfill_confidence(dry_run=not apply), indent=2))
+
+    elif cmd in ("backfill-currency", "backfill_currency"):
+        apply = "--apply" in sys.argv
+        print(f"Backfilling currency{' (APPLYING)' if apply else ' (dry run)'}...")
+        print(json.dumps(backfill_currency(dry_run=not apply), indent=2))
 
     elif cmd == "promote":
         if len(sys.argv) < 3:
