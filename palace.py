@@ -25,7 +25,9 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -79,9 +81,89 @@ def _ensure_dirs():
     Path(PALACE_DIR).mkdir(parents=True, exist_ok=True)
 
 
-def _get_collection(create=False):
+# ── Cross-process chroma safety ───────────────────────────────────────────────
+# chromadb's PersistentClient is NOT multi-process safe; concurrent writers
+# corrupt the HNSW index (incident 2026-05-16, see rebuild_chroma.py). Two
+# defenses: cache one client per path (stop per-call client churn), and an
+# advisory cross-process lock around every mutation.
+
+_LOCK_FILE = os.path.join(PALACE_DIR, ".chroma.lock")
+_LOCK_TIMEOUT = 30   # max seconds to wait for the lock
+_LOCK_STALE = 120    # an orphaned lock older than this is stolen
+_lock_depth = 0      # in-process reentrancy guard
+
+
+@contextmanager
+def _chroma_lock():
+    """Best-effort exclusive lock around chroma mutations. Reentrant within
+    a process. After timeout it proceeds anyway and logs — the MCP server
+    must never deadlock on this."""
+    global _lock_depth
+    if _lock_depth > 0:
+        _lock_depth += 1
+        try:
+            yield
+        finally:
+            _lock_depth -= 1
+        return
     _ensure_dirs()
-    client = chromadb.PersistentClient(path=PALACE_DB)
+    acquired = False
+    deadline = time.time() + _LOCK_TIMEOUT
+    while time.time() < deadline:
+        try:
+            fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time()}".encode())
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(_LOCK_FILE) > _LOCK_STALE:
+                    os.unlink(_LOCK_FILE)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.25)
+    if not acquired:
+        print("palace: chroma lock timeout — proceeding without it",
+              file=sys.stderr)
+    _lock_depth += 1
+    try:
+        yield
+    finally:
+        _lock_depth -= 1
+        if acquired:
+            try:
+                os.unlink(_LOCK_FILE)
+            except OSError:
+                pass
+
+
+_CHROMA_CLIENTS = {}  # path -> PersistentClient (keyed so tests can repoint)
+
+
+def _chroma_client():
+    _ensure_dirs()
+    c = _CHROMA_CLIENTS.get(PALACE_DB)
+    if c is None:
+        c = chromadb.PersistentClient(path=PALACE_DB)
+        _CHROMA_CLIENTS[PALACE_DB] = c
+    return c
+
+
+_DEFAULT_KG = {}  # KG_DB -> KnowledgeGraph (avoid re-running _init_db per call)
+
+
+def _default_kg():
+    kg = _DEFAULT_KG.get(KG_DB)
+    if kg is None:
+        kg = KnowledgeGraph()
+        _DEFAULT_KG[KG_DB] = kg
+    return kg
+
+
+def _get_collection(create=False):
+    client = _chroma_client()
     if create:
         return client.get_or_create_collection(COLLECTION_NAME)
     try:
@@ -139,17 +221,36 @@ class KnowledgeGraph:
                 conn.execute(f"ALTER TABLE triples ADD COLUMN {col}")
             except Exception:
                 pass  # Column already exists
-        # Backfill created_at from extracted_at for pre-bitemporal rows.
-        conn.execute(
-            "UPDATE triples SET created_at = COALESCE(extracted_at, CURRENT_TIMESTAMP) "
-            "WHERE created_at IS NULL"
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_invalidated ON triples(invalidated_at)")
-        conn.commit()
+        # Backfill created_at once. Guard so we don't open a write
+        # transaction on every construction (this runs per add_memory via
+        # facts-first). Wrapped: a transient lock here must never crash the
+        # importer/MCP server — the schema already exists, retry next time.
+        try:
+            if conn.execute(
+                "SELECT 1 FROM triples WHERE created_at IS NULL LIMIT 1"
+            ).fetchone():
+                conn.execute(
+                    "UPDATE triples SET created_at = "
+                    "COALESCE(extracted_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
+                )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_triples_invalidated "
+                         "ON triples(invalidated_at)")
+            conn.commit()
+        except Exception as e:
+            print(f"palace KG: deferred migration ({e})", file=sys.stderr)
         conn.close()
 
     def _conn(self):
-        return sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        # WAL = concurrent readers + one writer (vs default: writers block
+        # everything). busy_timeout retries instead of instantly raising
+        # "database is locked". Both reduce multi-process fragility.
+        try:
+            conn.execute("PRAGMA busy_timeout=8000")
+            conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        return conn
 
     def _eid(self, name: str) -> str:
         return name.lower().replace(" ", "_").replace("'", "")
@@ -448,7 +549,8 @@ def add_memory(wing: str, hall: str, room: str, content: str,
     }
     if drawer:
         meta["drawer"] = drawer
-    col.add(ids=[drawer_id], documents=[content], metadatas=[meta])
+    with _chroma_lock():
+        col.add(ids=[drawer_id], documents=[content], metadatas=[meta])
 
     # Facts-first: mirror discrete facts into the KG, sourced back to this
     # memory (the "citation"). Best-effort and gated — never mine the
@@ -457,7 +559,7 @@ def add_memory(wing: str, hall: str, room: str, content: str,
     extracted = 0
     if extract and not quarantined:
         try:
-            kg = KnowledgeGraph()
+            kg = _default_kg()
             for f in extract_facts(content, default_subject=wing):
                 kg.add_triple(f["subject"], f["predicate"], f["object"],
                               confidence=0.8, source=f"mem:{drawer_id}")
@@ -478,7 +580,8 @@ def delete_memory(memory_id: str):
     existing = col.get(ids=[memory_id])
     if not existing["ids"]:
         return {"success": False, "error": f"Not found: {memory_id}"}
-    col.delete(ids=[memory_id])
+    with _chroma_lock():
+        col.delete(ids=[memory_id])
     return {"success": True, "id": memory_id}
 
 
@@ -1107,13 +1210,14 @@ def consolidate_all(auto_delete: bool = False, similarity_threshold: float = 0.9
         total_dupes += len(dupes)
 
         if auto_delete and dupes:
-            for dupe in dupes:
-                # Delete the second one (keep the first)
-                try:
-                    col.delete(ids=[dupe["memory_b"]])
-                    deleted += 1
-                except Exception:
-                    pass
+            with _chroma_lock():
+                for dupe in dupes:
+                    # Delete the second one (keep the first)
+                    try:
+                        col.delete(ids=[dupe["memory_b"]])
+                        deleted += 1
+                    except Exception:
+                        pass
 
     return {
         "wings_checked": len(wings),
@@ -1171,8 +1275,9 @@ def merge_wings(dry_run: bool = True):
         return report
 
     batch = 200
-    for i in range(0, len(update_ids), batch):
-        col.update(ids=update_ids[i:i + batch], metadatas=update_metas[i:i + batch])
+    with _chroma_lock():
+        for i in range(0, len(update_ids), batch):
+            col.update(ids=update_ids[i:i + batch], metadatas=update_metas[i:i + batch])
     report["applied"] = True
     return report
 
@@ -1205,7 +1310,7 @@ def detect_contradictions(entity: str = None, auto_flag: bool = False,
     Reports — never deletes. Resolve real single-valued ones with
     palace_kg_supersede; multi-valued predicates surface as 'review'.
     """
-    kg = KnowledgeGraph()
+    kg = _default_kg()
     conn = kg._conn()
     q = """
         SELECT s.name, t.predicate, o.name, t.valid_from, t.created_at,
@@ -1386,8 +1491,9 @@ def backfill_confidence(dry_run: bool = True):
               "tier_distribution": dict(tiers), "applied": False}
     if dry_run or not upd_ids:
         return report
-    for i in range(0, len(upd_ids), 200):
-        col.update(ids=upd_ids[i:i + 200], metadatas=upd_metas[i:i + 200])
+    with _chroma_lock():
+        for i in range(0, len(upd_ids), 200):
+            col.update(ids=upd_ids[i:i + 200], metadatas=upd_metas[i:i + 200])
     report["applied"] = True
     return report
 
@@ -1414,7 +1520,7 @@ def backfill_facts(wing: str = None, dry_run: bool = True):
               "sample": plan[:15], "applied": False}
     if dry_run or not plan:
         return report
-    kg = KnowledgeGraph()
+    kg = _default_kg()
     for f in plan:
         kg.add_triple(f["subject"], f["predicate"], f["object"],
                       confidence=0.8, source=f"mem:{f['memory_id']}")
@@ -1439,7 +1545,8 @@ def promote_memory(memory_id: str, confidence: float = 1.0):
     prev = meta.get("added_by", "")
     if "promoted" not in prev:
         meta["added_by"] = (prev + "+promoted").lstrip("+")
-    col.update(ids=[memory_id], metadatas=[meta])
+    with _chroma_lock():
+        col.update(ids=[memory_id], metadatas=[meta])
     return {"success": True, "id": memory_id, "was": was,
             "now": {"confidence": confidence, "quarantined": meta["quarantined"]}}
 
