@@ -653,10 +653,12 @@ def search_memories(query: str, wing: str = None, hall: str = None,
         return {"error": str(e), "results": []}
 
     hits = []
-    for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+    for mid, doc, meta, dist in zip(results["ids"][0], results["documents"][0],
+                                    results["metadatas"][0], results["distances"][0]):
         if as_of is not None and not _believed_as_of(meta, as_of):
             continue
         hits.append({
+            "id": mid,
             "text": doc,
             "wing": meta.get("wing", "?"), "hall": meta.get("hall", "?"),
             "room": meta.get("room", "?"),

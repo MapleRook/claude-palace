@@ -50,6 +50,9 @@ Use these palace MCP tools to inspect the current state:
 2. palace_recall wing="{wing}" — see what's stored
 3. palace_kg_stats — check knowledge graph health
 4. palace_kg_audit stale_days=30 — find stale/unverified facts
+5. palace_search wing="{wing}" — for each topic/room with apparent
+   redundancy, search it; results include `id`, `date`, `current`. This
+   is how you surface currency candidates with the IDs the Verifier needs.
 
 After inspection, report:
 - Empty or sparse rooms (< 3 memories)
@@ -57,6 +60,12 @@ After inspection, report:
 - Rooms with high duplication (similar memories that should be consolidated)
 - Missing KG connections (entities mentioned in memories but not in KG)
 - Overall health score (1-10)
+- Currency candidates: pairs of CURRENT memories in the SAME wing where
+  one looks like a newer/more-complete statement of the same fact the
+  other makes (not merely the same topic). For each, give both `id`s,
+  a guess at which is newer (use `date` as a weak prior — content
+  recency wins over date), and a one-line reason. Skip pairs that are
+  genuinely complementary (both still true) — those are NOT candidates.
 
 Output your findings as JSON:
 {{
@@ -66,8 +75,16 @@ Output your findings as JSON:
   "stale_triples": [...],
   "consolidation_candidates": [...],
   "missing_kg_links": [...],
+  "currency_review": [
+    {{"older_id": "<id>", "newer_id": "<id>", "room": "<room>",
+      "reason": "<why newer_id supersedes older_id, or 'stale:<why>' if
+      older_id should just be retired with no replacement>"}}
+  ],
   "recommendations": [...]
-}}""",
+}}
+
+Keep the JSON compact — the Verifier consumes it and the handoff is
+size-bounded. Cap currency_review at the ~8 highest-signal pairs.""",
     },
     "verifier": {
         "model": "haiku",
@@ -84,13 +101,37 @@ Your job:
    - If it's outdated, call palace_kg_invalidate with the triple_id and a reason.
 2. For sparse rooms: check if there's content that should be there but isn't.
 3. For consolidation candidates: use palace_consolidate if appropriate.
+4. Prose currency — act on the Auditor's `currency_review` ONLY. For each
+   pair, first read both memories (palace_search wing="{wing}" with a
+   query from their topic; results carry `id`, `text`, `date`, `current`)
+   and confirm the Auditor's read with your own eyes. Then exactly one of:
+   - newer_id is a newer / more-complete statement of the SAME fact
+     older_id makes → palace_supersede(old_id=older_id, new_id=newer_id).
+   - reason is "stale:..." (older_id is obsolete/wrong with NO
+     replacement) → palace_retire(memory_id=older_id, reason="<short>").
+   - On your own inspection they are actually complementary (both still
+     true, different facts) → do nothing; list in currency_left_alone.
+   Hard rules:
+   - Same wing only. Never supersede across wings (the tool rejects it;
+     don't attempt it). Operate strictly within "{wing}".
+   - NEVER palace_delete for currency. Retire/supersede are reversible
+     (palace_restore); delete is not. If you make a call and immediately
+     doubt it, palace_restore and escalate instead.
+   - Not confident it's the same fact, or unsure which is newer? Do NOT
+     guess — put it in `escalated` for a Sonnet pass. A wrong supersede
+     hides a true memory; escalation is the cheap, correct default.
+   - Never touch quarantined/low-confidence memories here (they have
+     their own lifecycle); the Auditor's candidates are already current.
 
 Output your actions as JSON:
 {{
   "verified": [<triple_ids verified>],
   "invalidated": [<triple_ids invalidated with reasons>],
   "consolidated": [<rooms consolidated>],
-  "escalated": [<items too complex for Haiku, need Sonnet>]
+  "superseded": [{{"old_id": "<id>", "new_id": "<id>", "reason": "<why>"}}],
+  "retired": [{{"id": "<id>", "reason": "<why>"}}],
+  "currency_left_alone": [{{"pair": ["<id>", "<id>"], "why": "<both true>"}}],
+  "escalated": [<items too complex/ambiguous for Haiku, need Sonnet>]
 }}""",
     },
     "expander": {
@@ -221,6 +262,9 @@ def run_custodian(name: str, wing: str, budget: float,
         "mcp__palace__palace_kg_timeline",
         "mcp__palace__palace_kg_audit",
         "mcp__palace__palace_kg_verify",
+        "mcp__palace__palace_retire",
+        "mcp__palace__palace_supersede",
+        "mcp__palace__palace_restore",
     ])
 
     cmd = [
@@ -257,7 +301,11 @@ def run_custodian(name: str, wing: str, budget: float,
             "model": model,
             "success": result.returncode == 0,
             "elapsed": elapsed,
-            "output": text[:2000],
+            # Bumped 2000->6000: the auditor->verifier currency handoff
+            # carries memory IDs (~50 chars each); at 2000 they were
+            # truncated away and step-3 supersede/retire became
+            # non-functional. Still bounded for the log.
+            "output": text[:6000],
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -339,7 +387,10 @@ def run_sweep(wing: str, custodian_names: list = None,
 
         # Pass audit findings to downstream custodians
         if name == "auditor" and entry["success"]:
-            context["audit_findings"] = entry["output"][:1500]
+            # 5000 so currency_review (memory ID pairs) survives the
+            # handoff to the Verifier; palace_summary stays small (it is
+            # only a context blurb for the Expander).
+            context["audit_findings"] = entry["output"][:5000]
             context["palace_summary"] = entry["output"][:1000]
 
     return results
