@@ -590,9 +590,26 @@ def delete_memory(memory_id: str):
     return {"success": True, "id": memory_id}
 
 
+def _believed_as_of(meta: dict, as_of: str) -> bool:
+    """Transaction-time predicate for prose: was this memory part of
+    current understanding on date `as_of` (YYYY-MM-DD)? True if filed
+    on/before that date and not retired until after it. Mirrors the KG's
+    as_believed axis. Absent/empty retired_at = never retired. Date
+    granularity (first 10 chars) — filed_at is an ISO datetime, as_of a
+    date; comparing full strings would mis-order same-day records."""
+    filed = (meta.get("filed_at") or "")[:10]
+    if filed and filed > as_of:
+        return False
+    ret = (meta.get("retired_at") or "")[:10]
+    if ret and ret <= as_of:
+        return False
+    return True
+
+
 def search_memories(query: str, wing: str = None, hall: str = None,
                     room: str = None, drawer: str = None, n_results: int = 5,
-                    include_quarantined: bool = False):
+                    include_quarantined: bool = False,
+                    include_historical: bool = False, as_of: str = None):
     col = _get_collection()
     if not col:
         return {"error": "No palace found", "results": []}
@@ -608,6 +625,13 @@ def search_memories(query: str, wing: str = None, hall: str = None,
         where_clauses.append({"drawer": drawer})
     if not include_quarantined:
         where_clauses.append({"quarantined": False})
+    # Currency gate. Default: only current understanding. as_of does
+    # transaction-time travel (post-filter, since Chroma `where` can't
+    # express "retired_at absent OR > D"), so it must NOT also pin
+    # current=True or it would hide records that were current then but
+    # are retired now. include_historical bypasses the gate entirely.
+    if as_of is None and not include_historical:
+        where_clauses.append({"current": True})
 
     where = None
     if len(where_clauses) > 1:
@@ -615,7 +639,10 @@ def search_memories(query: str, wing: str = None, hall: str = None,
     elif len(where_clauses) == 1:
         where = where_clauses[0]
 
-    kwargs = {"query_texts": [query], "n_results": n_results,
+    # as_of post-filters in Python, so over-fetch to refill what the
+    # belief filter drops (semantic rank is approximate either way).
+    fetch_n = n_results if as_of is None else min(max(n_results * 5, n_results), 100)
+    kwargs = {"query_texts": [query], "n_results": fetch_n,
               "include": ["documents", "metadatas", "distances"]}
     if where:
         kwargs["where"] = where
@@ -627,6 +654,8 @@ def search_memories(query: str, wing: str = None, hall: str = None,
 
     hits = []
     for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+        if as_of is not None and not _believed_as_of(meta, as_of):
+            continue
         hits.append({
             "text": doc,
             "wing": meta.get("wing", "?"), "hall": meta.get("hall", "?"),
@@ -635,7 +664,10 @@ def search_memories(query: str, wing: str = None, hall: str = None,
             "similarity": round(1 - dist, 3),
             "date": meta.get("date", ""),
             "confidence": meta.get("confidence", 1.0),
+            "current": meta.get("current", True),
         })
+        if len(hits) >= n_results:
+            break
     return {"query": query, "results": hits}
 
 
@@ -646,7 +678,8 @@ class MemoryStack:
     def __init__(self):
         self.palace_path = PALACE_DB
 
-    def wake_up(self, wing: str = None, include_quarantined: bool = False) -> str:
+    def wake_up(self, wing: str = None, include_quarantined: bool = False,
+                include_historical: bool = False, as_of: str = None) -> str:
         """L0 (identity) + L1 (essential facts). ~200-600 tokens."""
         parts = []
 
@@ -666,6 +699,8 @@ class MemoryStack:
                 wcl.append({"wing": canonicalize_wing(wing)})
             if not include_quarantined:
                 wcl.append({"quarantined": False})
+            if as_of is None and not include_historical:
+                wcl.append({"current": True})
             if len(wcl) > 1:
                 kwargs["where"] = {"$and": wcl}
             elif wcl:
@@ -674,6 +709,11 @@ class MemoryStack:
                 results = col.get(**kwargs)
                 docs = results.get("documents", [])
                 metas = results.get("metadatas", [])
+                if as_of is not None:
+                    kept = [(d, m) for d, m in zip(docs, metas)
+                            if _believed_as_of(m, as_of)]
+                    docs = [d for d, _ in kept]
+                    metas = [m for _, m in kept]
                 if docs:
                     by_room = defaultdict(list)
                     for doc, meta in zip(docs, metas):
@@ -699,7 +739,8 @@ class MemoryStack:
         return "\n".join(parts)
 
     def recall(self, wing: str = None, room: str = None, n_results: int = 10,
-               include_quarantined: bool = False) -> str:
+               include_quarantined: bool = False,
+               include_historical: bool = False, as_of: str = None) -> str:
         """L2: On-demand retrieval by wing/room."""
         col = _get_collection()
         if not col:
@@ -712,6 +753,8 @@ class MemoryStack:
             where_clauses.append({"room": room})
         if not include_quarantined:
             where_clauses.append({"quarantined": False})
+        if as_of is None and not include_historical:
+            where_clauses.append({"current": True})
 
         where = None
         if len(where_clauses) > 1:
@@ -719,7 +762,12 @@ class MemoryStack:
         elif len(where_clauses) == 1:
             where = where_clauses[0]
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": n_results}
+        # as_of post-filters in Python; fetch unbounded so the limit is
+        # applied AFTER the belief filter (else we'd cap before filtering
+        # and under-return). Default path keeps the cheap get-side limit.
+        kwargs = {"include": ["documents", "metadatas"]}
+        if as_of is None:
+            kwargs["limit"] = n_results
         if where:
             kwargs["where"] = where
 
@@ -730,6 +778,11 @@ class MemoryStack:
 
         docs = results.get("documents", [])
         metas = results.get("metadatas", [])
+        if as_of is not None:
+            kept = [(d, m) for d, m in zip(docs, metas)
+                    if _believed_as_of(m, as_of)][:n_results]
+            docs = [d for d, _ in kept]
+            metas = [m for _, m in kept]
         if not docs:
             return f"No memories found for wing={wing} room={room}"
 
@@ -744,10 +797,13 @@ class MemoryStack:
         return "\n".join(lines)
 
     def search(self, query: str, wing: str = None, room: str = None,
-               n_results: int = 5, include_quarantined: bool = False) -> str:
+               n_results: int = 5, include_quarantined: bool = False,
+               include_historical: bool = False, as_of: str = None) -> str:
         """L3: Deep semantic search."""
         result = search_memories(query, wing=wing, room=room, n_results=n_results,
-                                 include_quarantined=include_quarantined)
+                                 include_quarantined=include_quarantined,
+                                 include_historical=include_historical,
+                                 as_of=as_of)
         if result.get("error"):
             return result["error"]
         if not result["results"]:
@@ -1642,6 +1698,120 @@ def promote_memory(memory_id: str, confidence: float = 1.0):
             "now": {"confidence": confidence, "quarantined": meta["quarantined"]}}
 
 
+# ── Prose Currency ───────────────────────────────────────────────────────────
+# The prose analogue of the KG's invalidate/supersede. Retire is the
+# transaction-time retraction: the memory stops being current understanding
+# but is never deleted — reachable via include_historical / as_of, exactly
+# the "keep it clean for the working AI, don't lose the archive" split.
+# All metadata-only and reversible (Chroma cannot delete keys, so restore
+# blanks the retire fields; they are descriptive payload, never filter
+# keys, so an empty string is semantically clean).
+
+
+def retire_memory(memory_id: str, reason: str = "stale",
+                   superseded_by: str = None):
+    """Drop a memory out of current understanding. Sets current=False so
+    the default read paths stop returning it; the record stays in the
+    store for include_historical / as_of."""
+    col = _get_collection()
+    if not col:
+        return {"success": False, "error": "No palace found"}
+    got = col.get(ids=[memory_id], include=["metadatas"])
+    if not got.get("ids"):
+        return {"success": False, "error": f"Not found: {memory_id}"}
+    meta = dict(got["metadatas"][0])
+    was_current = meta.get("current", True)
+    meta["current"] = False
+    meta["retired_at"] = datetime.now().isoformat()
+    meta["retired_reason"] = reason
+    if superseded_by:
+        meta["superseded_by"] = superseded_by
+    with _chroma_lock():
+        col.update(ids=[memory_id], metadatas=[meta])
+    return {"success": True, "id": memory_id, "was_current": was_current,
+            "retired_reason": reason, "superseded_by": superseded_by or "",
+            "note": "excluded from default retrieval; reachable via "
+                    "include_historical / as_of"}
+
+
+def restore_memory(memory_id: str):
+    """Inverse of retire — return a memory to current understanding."""
+    col = _get_collection()
+    if not col:
+        return {"success": False, "error": "No palace found"}
+    got = col.get(ids=[memory_id], include=["metadatas"])
+    if not got.get("ids"):
+        return {"success": False, "error": f"Not found: {memory_id}"}
+    meta = dict(got["metadatas"][0])
+    was = {"current": meta.get("current", True),
+           "retired_reason": meta.get("retired_reason", "")}
+    meta["current"] = True
+    meta["retired_at"] = ""
+    meta["retired_reason"] = ""
+    meta["superseded_by"] = ""
+    with _chroma_lock():
+        col.update(ids=[memory_id], metadatas=[meta])
+    return {"success": True, "id": memory_id, "was": was}
+
+
+def supersede_memory(old_id: str, new_id: str):
+    """Mark old_id as replaced by new_id. Same-wing scope guard: prose
+    supersession lineage never crosses a wing — the structural antidote to
+    flat current/archive scope loss (a memory true in another wing is not
+    a stale version of this one)."""
+    if old_id == new_id:
+        return {"success": False, "error": "old_id and new_id are the same"}
+    col = _get_collection()
+    if not col:
+        return {"success": False, "error": "No palace found"}
+    got = col.get(ids=[old_id, new_id], include=["metadatas"])
+    found = dict(zip(got.get("ids", []), got.get("metadatas", [])))
+    if old_id not in found:
+        return {"success": False, "error": f"old_id not found: {old_id}"}
+    if new_id not in found:
+        return {"success": False, "error": f"new_id not found: {new_id}"}
+    ow = canonicalize_wing(found[old_id].get("wing", ""))
+    nw = canonicalize_wing(found[new_id].get("wing", ""))
+    if ow != nw:
+        return {"success": False,
+                "error": f"scope violation: old wing '{ow}' != new wing "
+                         f"'{nw}'; supersession may not cross wings"}
+    r = retire_memory(old_id, reason="superseded", superseded_by=new_id)
+    if not r.get("success"):
+        return r
+    return {"success": True, "superseded": old_id, "now": new_id, "wing": ow}
+
+
+def supersede_with(old_id: str, new_content: str, wing: str = None,
+                   hall: str = None, room: str = None, drawer: str = None,
+                   added_by: str = "claude"):
+    """Convenience: mint a replacement memory (inheriting old's scope
+    unless overridden), then supersede. Wrapper over add_memory +
+    supersede_memory."""
+    col = _get_collection()
+    if not col:
+        return {"success": False, "error": "No palace found"}
+    got = col.get(ids=[old_id], include=["metadatas"])
+    if not got.get("ids"):
+        return {"success": False, "error": f"old_id not found: {old_id}"}
+    om = got["metadatas"][0]
+    res = add_memory(
+        wing=wing or om.get("wing", "unknown"),
+        hall=hall or om.get("hall", "project"),
+        room=room or om.get("room", "general"),
+        content=new_content, added_by=added_by,
+        drawer=drawer or om.get("drawer"),
+    )
+    if not res.get("success"):
+        return {"success": False,
+                "error": f"new memory not created: "
+                         f"{res.get('reason', res.get('error', '?'))}",
+                "hint": "if duplicate, call supersede_memory(old_id, "
+                        "<existing id>) directly"}
+    sup = supersede_memory(old_id, res["id"])
+    return {**sup, "new_id": res.get("id")}
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1660,6 +1830,9 @@ if __name__ == "__main__":
         print("  python palace.py contradictions [--flag] [entity]  KG conflicting facts")
         print("  python palace.py backfill-confidence [--apply] Stamp confidence/quarantine")
         print("  python palace.py backfill-currency [--apply]  Stamp `current` + repair keyless")
+        print("  python palace.py retire <memory_id> [reason]  Drop from current understanding")
+        print("  python palace.py restore <memory_id>          Return a memory to current")
+        print("  python palace.py supersede <old_id> <new_id>  old replaced by new (same wing)")
         print("  python palace.py promote <memory_id> [conf]   Un-quarantine a memory")
         print("  python palace.py backfill-facts [--apply] [wing]  Mirror facts to KG")
         sys.exit(0)
@@ -1734,6 +1907,25 @@ if __name__ == "__main__":
         apply = "--apply" in sys.argv
         print(f"Backfilling currency{' (APPLYING)' if apply else ' (dry run)'}...")
         print(json.dumps(backfill_currency(dry_run=not apply), indent=2))
+
+    elif cmd == "retire":
+        if len(sys.argv) < 3:
+            print("Usage: python palace.py retire <memory_id> [reason]")
+            sys.exit(1)
+        reason = sys.argv[3] if len(sys.argv) > 3 else "stale"
+        print(json.dumps(retire_memory(sys.argv[2], reason=reason), indent=2))
+
+    elif cmd == "restore":
+        if len(sys.argv) < 3:
+            print("Usage: python palace.py restore <memory_id>")
+            sys.exit(1)
+        print(json.dumps(restore_memory(sys.argv[2]), indent=2))
+
+    elif cmd == "supersede":
+        if len(sys.argv) < 4:
+            print("Usage: python palace.py supersede <old_id> <new_id>")
+            sys.exit(1)
+        print(json.dumps(supersede_memory(sys.argv[2], sys.argv[3]), indent=2))
 
     elif cmd == "promote":
         if len(sys.argv) < 3:

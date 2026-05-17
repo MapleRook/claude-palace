@@ -6,11 +6,11 @@ palace_mcp.py — MCP server exposing memory palace tools to Claude Code
 Install:
   claude mcp add palace -- python /path/to/claude-palace/palace_mcp.py
 
-Tools (21 total):
+Tools (25 total):
 
-  Read:
+  Read (default retrieval = current understanding only):
     palace_status          — overview: memory counts, wings, halls
-    palace_search          — semantic search with wing/hall/room filters
+    palace_search          — semantic search; include_historical / as_of for archive
     palace_recall          — on-demand L2 retrieval by wing/room
     palace_wake_up         — L0+L1 context for session start
 
@@ -18,6 +18,12 @@ Tools (21 total):
     palace_add             — store a memory (confidence-scored, dup-checked)
     palace_delete          — remove a memory by ID
     palace_promote         — un-quarantine a verified-good memory
+
+  Prose currency (analogue of KG invalidate/supersede):
+    palace_retire          — drop a memory from current understanding (kept, not deleted)
+    palace_restore         — return a retired memory to current
+    palace_supersede       — old memory replaced by new (same-wing guard)
+    palace_supersede_with  — mint replacement + supersede in one call
 
   Knowledge Graph:
     palace_kg_query        — entity facts, bitemporal (as_of / as_believed)
@@ -44,6 +50,7 @@ from palace import (
     migrate_existing_memories, onboard_project,
     detect_cross_project_patterns, consolidate_all,
     detect_contradictions, promote_memory,
+    retire_memory, restore_memory, supersede_memory, supersede_with,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
@@ -59,17 +66,38 @@ def tool_status():
     return _stack.status()
 
 def tool_search(query: str, limit: int = 5, wing: str = None, hall: str = None,
-                room: str = None, drawer: str = None, include_quarantined: bool = False):
+                room: str = None, drawer: str = None, include_quarantined: bool = False,
+                include_historical: bool = False, as_of: str = None):
     return search_memories(query, wing=wing, hall=hall, room=room, drawer=drawer,
-                           n_results=limit, include_quarantined=include_quarantined)
+                           n_results=limit, include_quarantined=include_quarantined,
+                           include_historical=include_historical, as_of=as_of)
 
 def tool_recall(wing: str = None, room: str = None, n_results: int = 10,
-                include_quarantined: bool = False):
+                include_quarantined: bool = False,
+                include_historical: bool = False, as_of: str = None):
     return {"text": _stack.recall(wing=wing, room=room, n_results=n_results,
-                                  include_quarantined=include_quarantined)}
+                                  include_quarantined=include_quarantined,
+                                  include_historical=include_historical, as_of=as_of)}
 
-def tool_wake_up(wing: str = None, include_quarantined: bool = False):
-    return {"text": _stack.wake_up(wing=wing, include_quarantined=include_quarantined)}
+def tool_wake_up(wing: str = None, include_quarantined: bool = False,
+                 include_historical: bool = False, as_of: str = None):
+    return {"text": _stack.wake_up(wing=wing, include_quarantined=include_quarantined,
+                                   include_historical=include_historical, as_of=as_of)}
+
+def tool_retire(memory_id: str, reason: str = "stale", superseded_by: str = None):
+    return retire_memory(memory_id, reason=reason, superseded_by=superseded_by)
+
+def tool_restore(memory_id: str):
+    return restore_memory(memory_id)
+
+def tool_supersede(old_id: str, new_id: str):
+    return supersede_memory(old_id, new_id)
+
+def tool_supersede_with(old_id: str, new_content: str, wing: str = None,
+                        hall: str = None, room: str = None, drawer: str = None,
+                        added_by: str = "claude"):
+    return supersede_with(old_id, new_content, wing=wing, hall=hall,
+                          room=room, drawer=drawer, added_by=added_by)
 
 def tool_add(wing: str, hall: str, room: str, content: str,
              source_file: str = None, added_by: str = "claude",
@@ -193,6 +221,8 @@ TOOLS = {
                 "room": {"type": "string", "description": "Filter by topic (e.g. 'vertex-ai-search')"},
                 "drawer": {"type": "string", "description": "Filter by sub-topic within room (optional, 4th hierarchy level)"},
                 "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories (digest regex extracts, speculative custodian fill). Default false."},
+                "include_historical": {"type": "boolean", "description": "Include retired/superseded memories (no longer current understanding). Default false — default retrieval only sees current memories."},
+                "as_of": {"type": "string", "description": "Transaction-time travel YYYY-MM-DD: return memories as they stood in current understanding on that date (filed by then, not yet retired). The archive query."},
             },
             "required": ["query"],
         },
@@ -207,6 +237,8 @@ TOOLS = {
                 "room": {"type": "string", "description": "Topic to recall (e.g. 'alger-county')"},
                 "n_results": {"type": "integer", "description": "Max results (default 10)"},
                 "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories. Default false."},
+                "include_historical": {"type": "boolean", "description": "Include retired/superseded memories. Default false."},
+                "as_of": {"type": "string", "description": "Transaction-time travel YYYY-MM-DD: memories as they stood in current understanding on that date."},
             },
         },
         "handler": tool_recall,
@@ -218,6 +250,8 @@ TOOLS = {
             "properties": {
                 "wing": {"type": "string", "description": "Optional project focus for wake-up"},
                 "include_quarantined": {"type": "boolean", "description": "Include low-confidence/quarantined memories. Default false."},
+                "include_historical": {"type": "boolean", "description": "Include retired/superseded memories. Default false."},
+                "as_of": {"type": "string", "description": "Transaction-time travel YYYY-MM-DD: identity + memories as they stood on that date."},
             },
         },
         "handler": tool_wake_up,
@@ -262,6 +296,59 @@ TOOLS = {
             "required": ["memory_id"],
         },
         "handler": tool_promote,
+    },
+    "palace_retire": {
+        "description": "Drop a memory out of current understanding (current=false). It stops appearing in default search/recall/wake_up but is NOT deleted — reachable via include_historical or as_of. The prose analogue of palace_kg_invalidate(retract=true). Reversible with palace_restore.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "ID of the memory to retire"},
+                "reason": {"type": "string", "description": "Why: stale | contradicted | user-retracted | superseded (default: stale)"},
+                "superseded_by": {"type": "string", "description": "ID of the replacement memory, if this is a supersession (optional)"},
+            },
+            "required": ["memory_id"],
+        },
+        "handler": tool_retire,
+    },
+    "palace_restore": {
+        "description": "Return a retired memory to current understanding (inverse of palace_retire). Use if a retire was wrong.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "ID of the memory to restore"},
+            },
+            "required": ["memory_id"],
+        },
+        "handler": tool_restore,
+    },
+    "palace_supersede": {
+        "description": "Mark an existing memory as replaced by another existing memory. Retires old_id with superseded_by=new_id. Same-wing scope guard: refuses if the two memories are in different wings (a memory true in another project is not a stale version of this one). The 'prose moved A -> B' primitive.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_id": {"type": "string", "description": "The memory being replaced"},
+                "new_id": {"type": "string", "description": "The replacement memory (must already exist, same wing)"},
+            },
+            "required": ["old_id", "new_id"],
+        },
+        "handler": tool_supersede,
+    },
+    "palace_supersede_with": {
+        "description": "Convenience: create a replacement memory (inheriting old's wing/hall/room/drawer unless overridden), then supersede old with it. Wrapper over palace_add + palace_supersede. If the new content is a near-duplicate it will not be created — supersede the existing memory directly instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_id": {"type": "string", "description": "The memory being replaced"},
+                "new_content": {"type": "string", "description": "Content of the replacement memory — verbatim"},
+                "wing": {"type": "string", "description": "Override wing (default: inherit from old)"},
+                "hall": {"type": "string", "description": "Override hall (default: inherit from old)"},
+                "room": {"type": "string", "description": "Override room (default: inherit from old)"},
+                "drawer": {"type": "string", "description": "Override drawer (default: inherit from old)"},
+                "added_by": {"type": "string", "description": "Who stored this (default: claude)"},
+            },
+            "required": ["old_id", "new_content"],
+        },
+        "handler": tool_supersede_with,
     },
     "palace_kg_query": {
         "description": "Query the knowledge graph for an entity's relationships. Bitemporal: as_of filters valid-time (true in the world on that date); as_believed filters transaction-time (what we believed on that date, including facts later retracted). Default returns only currently-believed facts.",
