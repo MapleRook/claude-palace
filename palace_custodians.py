@@ -445,22 +445,50 @@ def main():
                         help=f"Use higher expander budget (${BOOTSTRAP_EXPANDER_BUDGET}) for initial population")
     parser.add_argument("--force", action="store_true",
                         help="Run even if active session detected")
+    parser.add_argument("--lean", action="store_true",
+                        help="Cost-minimal: if --only is not given, run just "
+                             "auditor+verifier (Haiku, the arbiter loop) — "
+                             "skips the Sonnet expander/structurer and linker")
+    parser.add_argument("--wings", help="Comma-separated wing allowlist "
+                        "(overrides --all-wings)")
+    parser.add_argument("--wings-file", help="Path to a newline-delimited wing "
+                        "allowlist (# comments and blanks ignored)")
+    parser.add_argument("--max-wings", type=int, default=0,
+                        help="Cap wings swept this run (0 = no cap). Lets a "
+                             "schedule rotate a cheap fixed-size slice.")
     args = parser.parse_args()
 
-    if not args.wing and not args.all_wings:
-        parser.error("Specify --wing <name> or --all-wings")
+    if not args.wing and not args.all_wings and not args.wings and not args.wings_file:
+        parser.error("Specify --wing, --all-wings, --wings, or --wings-file")
 
     if args.force:
         # Temporarily disable lock check by removing it
         from active_lock import release_lock
         release_lock()
 
-    if args.all_wings:
+    # Wing set resolution (allowlist sources beat the broad ones).
+    from palace import canonicalize_wing
+    if args.wings_file:
+        with open(args.wings_file, encoding="utf-8") as f:
+            raw = [ln.strip() for ln in f]
+        wings = [canonicalize_wing(w) for w in raw
+                 if w and not w.startswith("#")]
+    elif args.wings:
+        wings = [canonicalize_wing(w) for w in args.wings.split(",") if w.strip()]
+    elif args.all_wings:
         wings = get_all_wings()
-        if args.verbose:
-            print(f"Sweeping {len(wings)} wings: {', '.join(wings)}", file=sys.stderr)
     else:
-        wings = [args.wing]
+        wings = [canonicalize_wing(args.wing)]
+
+    if args.max_wings and len(wings) > args.max_wings:
+        wings = wings[:args.max_wings]
+
+    only = args.only or (["auditor", "verifier"] if args.lean else None)
+
+    if args.verbose:
+        print(f"Sweeping {len(wings)} wing(s) "
+              f"[{'lean: auditor+verifier' if only == ['auditor', 'verifier'] and args.lean else (','.join(only) if only else 'all 5 custodians')}]: "
+              f"{', '.join(wings)}", file=sys.stderr)
 
     all_results = []
     for wing in wings:
@@ -469,7 +497,7 @@ def main():
             print(f"Wing: {wing}", file=sys.stderr)
             print(f"{'='*40}", file=sys.stderr)
 
-        results = run_sweep(wing, custodian_names=args.only,
+        results = run_sweep(wing, custodian_names=only,
                             budget=args.budget, bootstrap=args.bootstrap,
                             verbose=args.verbose)
         all_results.extend(results)
