@@ -49,6 +49,12 @@ COLLECTION_NAME = "claude_memories"
 # Our memory types map to halls
 HALLS = ["user", "feedback", "project", "reference", "task_context"]
 
+# [[room-name]] tokens in memory bodies are wiki-style cross-links. They
+# get resolved to memory ids at write time and stored as bidirectional
+# linked_to triples in the KG. search_memories(expand_links=True) then
+# post-fetches them so co-relevant context surfaces together.
+_LINK_RE = re.compile(r"\[\[([a-z0-9][a-z0-9_-]*)\]\]")
+
 # Wing-name variants that lost their separators in older digest runs.
 # Keyed by the fully separator-stripped, lowercased form.
 WING_ALIASES = {
@@ -516,6 +522,50 @@ def _derive_confidence(added_by: str = "", room: str = ""):
     return 1.0, False
 
 
+def _resolve_link_targets(target_rooms, prefer_wing=None):
+    """Resolve [[room-name]] tokens to currently-believed memory ids.
+
+    Preference order: same wing first (typed within the same project),
+    then any wing. Returns a list of ids (may be empty if no match).
+    Silent on lookup errors — binding is best-effort, not load-bearing.
+    """
+    col = _get_collection()
+    if not col or not target_rooms:
+        return []
+    found = []
+    seen = set()
+    for room in target_rooms:
+        ids = []
+        if prefer_wing:
+            try:
+                res = col.get(
+                    where={"$and": [
+                        {"room": {"$eq": room}},
+                        {"wing": {"$eq": prefer_wing}},
+                        {"current": {"$eq": True}},
+                    ]}
+                )
+                ids = list(res.get("ids") or [])
+            except Exception:
+                ids = []
+        if not ids:
+            try:
+                res = col.get(
+                    where={"$and": [
+                        {"room": {"$eq": room}},
+                        {"current": {"$eq": True}},
+                    ]}
+                )
+                ids = list(res.get("ids") or [])
+            except Exception:
+                ids = []
+        for mid in ids:
+            if mid not in seen:
+                seen.add(mid)
+                found.append(mid)
+    return found
+
+
 def add_memory(wing: str, hall: str, room: str, content: str,
                source_file: str = None, added_by: str = "claude",
                drawer: str = None, confidence: float = None,
@@ -572,9 +622,31 @@ def add_memory(wing: str, hall: str, room: str, content: str,
         except Exception:
             pass
 
+    # Wiki-link binding: parse [[room-name]] tokens, resolve to existing
+    # memory ids, write bidirectional linked_to KG triples. Best-effort —
+    # binding failure must not break the primary write.
+    links_created = []
+    try:
+        target_rooms = list(set(_LINK_RE.findall(content)))
+        if target_rooms:
+            target_ids = _resolve_link_targets(target_rooms, prefer_wing=wing)
+            if target_ids:
+                kg = _default_kg()
+                for tid in target_ids:
+                    if tid == drawer_id:
+                        continue
+                    kg.add_triple(drawer_id, "linked_to", tid,
+                                  confidence=1.0, source=f"link:{room}")
+                    kg.add_triple(tid, "linked_to", drawer_id,
+                                  confidence=1.0, source=f"link:{room}")
+                    links_created.append(tid)
+    except Exception:
+        pass
+
     return {"success": True, "id": drawer_id, "wing": wing, "hall": hall,
             "room": room, "confidence": confidence, "quarantined": quarantined,
             "facts_extracted": extracted,
+            "links_created": links_created,
             **({"drawer": drawer} if drawer else {})}
 
 
@@ -606,10 +678,49 @@ def _believed_as_of(meta: dict, as_of: str) -> bool:
     return True
 
 
+def _linked_ids_for(direct_ids):
+    """Return {memory_id: [linked_memory_ids]} from the KG for the given
+    memory ids. One query covers all of them. Used by expand_links to
+    co-surface wiki-linked memories alongside direct semantic hits."""
+    if not direct_ids:
+        return {}
+    try:
+        kg = _default_kg()
+        conn = kg._conn()
+        # The KG stores entity ids (sha1 of name) under subject/object;
+        # for memory→memory triples written by add_memory, the names ARE
+        # the drawer ids, so the entity id is sha1(drawer_id). Use the
+        # same _eid hashing the KG uses.
+        subj_eids = {kg._eid(mid): mid for mid in direct_ids}
+        if not subj_eids:
+            return {}
+        placeholders = ",".join("?" * len(subj_eids))
+        rows = conn.execute(
+            f"""SELECT t.subject, e.name
+                FROM triples t
+                JOIN entities e ON e.id = t.object
+                WHERE t.subject IN ({placeholders})
+                  AND t.predicate = 'linked_to'
+                  AND t.invalidated_at IS NULL
+                  AND t.valid_to IS NULL""",
+            tuple(subj_eids.keys()),
+        ).fetchall()
+        conn.close()
+        out = {}
+        for subj_eid, obj_name in rows:
+            mid = subj_eids.get(subj_eid)
+            if mid:
+                out.setdefault(mid, []).append(obj_name)
+        return out
+    except Exception:
+        return {}
+
+
 def search_memories(query: str, wing: str = None, hall: str = None,
                     room: str = None, drawer: str = None, n_results: int = 5,
                     include_quarantined: bool = False,
-                    include_historical: bool = False, as_of: str = None):
+                    include_historical: bool = False, as_of: str = None,
+                    expand_links: bool = True):
     col = _get_collection()
     if not col:
         return {"error": "No palace found", "results": []}
@@ -670,6 +781,53 @@ def search_memories(query: str, wing: str = None, hall: str = None,
         })
         if len(hits) >= n_results:
             break
+
+    # Wiki-link expansion: bring in [[linked]] memories that didn't make
+    # the top-k cut. Tag each with `linked_via` so the caller (Claude or
+    # a viz) can see why it's there. Disabled by passing expand_links=False.
+    if expand_links and hits:
+        try:
+            direct_ids = [h["id"] for h in hits]
+            already = set(direct_ids)
+            linked = _linked_ids_for(direct_ids)
+            extra_ids = []
+            extra_sources = {}  # extra_id -> first source direct id that brought it in
+            for src, lst in linked.items():
+                for lid in lst:
+                    if lid in already:
+                        continue
+                    if lid not in extra_sources:
+                        extra_sources[lid] = src
+                        extra_ids.append(lid)
+                    already.add(lid)
+            if extra_ids:
+                fetched = col.get(ids=extra_ids, include=["documents", "metadatas"])
+                for fid, fdoc, fmeta in zip(fetched.get("ids") or [],
+                                            fetched.get("documents") or [],
+                                            fetched.get("metadatas") or []):
+                    # Honor the same filters the main query used.
+                    if not include_quarantined and fmeta.get("quarantined"):
+                        continue
+                    if (as_of is None and not include_historical
+                            and not fmeta.get("current", True)):
+                        continue
+                    if as_of is not None and not _believed_as_of(fmeta, as_of):
+                        continue
+                    hits.append({
+                        "id": fid,
+                        "text": fdoc,
+                        "wing": fmeta.get("wing", "?"), "hall": fmeta.get("hall", "?"),
+                        "room": fmeta.get("room", "?"),
+                        "source_file": Path(fmeta.get("source_file", "")).name if fmeta.get("source_file") else "",
+                        "similarity": None,  # not a similarity hit
+                        "date": fmeta.get("date", ""),
+                        "confidence": fmeta.get("confidence", 1.0),
+                        "current": fmeta.get("current", True),
+                        "linked_via": extra_sources[fid],
+                    })
+        except Exception:
+            pass
+
     return {"query": query, "results": hits}
 
 
