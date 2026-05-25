@@ -10,3 +10,4 @@ identity.txt
 *.jsonl
 .active_lock
 chroma/
+.claude/settings.local.json
