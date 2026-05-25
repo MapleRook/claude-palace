@@ -280,11 +280,19 @@ def run_custodian(name: str, wing: str, budget: float,
         print(f"  [{custodian['label']}] Starting ({model}, ${budget} budget)...",
               file=sys.stderr)
 
+    # Scrub env: ANTHROPIC_API_KEY in the subprocess environment would
+    # silently flip headless `claude -p` from subscription auth to metered
+    # API billing (documented $1.8k-class incident). Never inherit it into
+    # custodian calls, regardless of what the surrounding shell exports.
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+
     start = time.time()
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=300, encoding="utf-8", errors="replace",
+            env=env,
         )
         elapsed = round(time.time() - start, 1)
 
@@ -417,6 +425,65 @@ def _count_recent_linker_failures(wing: str) -> int:
         return 0
 
 
+def wings_with_churn_since_last() -> list:
+    """Wings that have received writes since their last successful auditor
+    sweep. Includes wings with memories but no successful auditor entry
+    (never swept). Ordered: never-swept first, then by oldest-sweep
+    (largest gap), so --max-wings caps the slack sensibly. ISO timestamp
+    strings compare lexicographically — no parsing needed.
+
+    The arbiter (step-3 currency work) and dedup have nothing to do on a
+    wing with no new content; this selector keeps the schedule structurally
+    cost-minimal.
+    """
+    last_swept = {}
+    if LOG_FILE.exists():
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    if e.get("custodian") != "auditor" or not e.get("success"):
+                        continue
+                    w, ts = e.get("wing", ""), e.get("timestamp", "")
+                    if not w or not ts:
+                        continue
+                    if w not in last_swept or ts > last_swept[w]:
+                        last_swept[w] = ts
+        except OSError:
+            pass
+
+    try:
+        from palace import _get_collection
+        col = _get_collection()
+    except Exception:
+        return []
+    if not col:
+        return []
+    g = col.get(include=["metadatas"])
+    latest_write = {}
+    for m in g.get("metadatas", []):
+        w = m.get("wing", "")
+        ts = m.get("filed_at", "") or m.get("date", "")
+        if not w or not ts:
+            continue
+        if w not in latest_write or ts > latest_write[w]:
+            latest_write[w] = ts
+
+    out = []
+    for w, write_ts in latest_write.items():
+        swept_ts = last_swept.get(w, "")
+        if not swept_ts or write_ts > swept_ts:
+            out.append((w, swept_ts, write_ts))
+    out.sort(key=lambda x: (x[1], x[2]))
+    return [w for w, _, _ in out]
+
+
 def get_all_wings() -> list:
     """Get list of known wings from palace (authoritative: collection metadata)."""
     try:
@@ -456,25 +523,46 @@ def main():
     parser.add_argument("--max-wings", type=int, default=0,
                         help="Cap wings swept this run (0 = no cap). Lets a "
                              "schedule rotate a cheap fixed-size slice.")
+    parser.add_argument("--since-last", action="store_true",
+                        help="Sweep only wings with writes since their last "
+                             "successful auditor sweep (or never swept). "
+                             "Pair with --lean and --max-wings for the "
+                             "cost-minimal scheduled mode. Intersects with "
+                             "--wings / --wings-file if either is given.")
     args = parser.parse_args()
 
-    if not args.wing and not args.all_wings and not args.wings and not args.wings_file:
-        parser.error("Specify --wing, --all-wings, --wings, or --wings-file")
+    if not (args.wing or args.all_wings or args.wings or args.wings_file or args.since_last):
+        parser.error("Specify --wing, --all-wings, --wings, --wings-file, "
+                     "or --since-last")
 
     if args.force:
         # Temporarily disable lock check by removing it
         from active_lock import release_lock
         release_lock()
 
-    # Wing set resolution (allowlist sources beat the broad ones).
+    # Wing set resolution: --since-last selects from real churn; an
+    # allowlist (--wings / --wings-file) filters it; --all-wings is the
+    # blunt broadcast.
     from palace import canonicalize_wing
+    allowlist = None
     if args.wings_file:
         with open(args.wings_file, encoding="utf-8") as f:
             raw = [ln.strip() for ln in f]
-        wings = [canonicalize_wing(w) for w in raw
-                 if w and not w.startswith("#")]
+        allowlist = [canonicalize_wing(w) for w in raw
+                     if w and not w.startswith("#")]
     elif args.wings:
-        wings = [canonicalize_wing(w) for w in args.wings.split(",") if w.strip()]
+        allowlist = [canonicalize_wing(w) for w in args.wings.split(",")
+                     if w.strip()]
+
+    if args.since_last:
+        churn = wings_with_churn_since_last()
+        if allowlist is not None:
+            aset = set(allowlist)
+            wings = [w for w in churn if w in aset]
+        else:
+            wings = churn
+    elif allowlist is not None:
+        wings = allowlist
     elif args.all_wings:
         wings = get_all_wings()
     else:

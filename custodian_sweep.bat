@@ -28,7 +28,7 @@ if %errorlevel% == 0 (
 
 REM Lean arbiter sweep over the allowlist, capped. --force is safe here:
 REM the active-lock check above already gated us.
-%VENV_PYTHON% "%SCRIPTS%\palace_custodians.py" --lean --wings-file "%WINGS%" --max-wings 8 --budget 0.15 --verbose --force >> "%LOG%" 2>&1
+%VENV_PYTHON% "%SCRIPTS%\palace_custodians.py" --lean --since-last --wings-file "%WINGS%" --max-wings 8 --budget 0.15 --verbose --force >> "%LOG%" 2>&1
 
 REM Export palace to sync dir
 %VENV_PYTHON% "%SCRIPTS%\palace_sync.py" export >> "%LOG%" 2>&1
