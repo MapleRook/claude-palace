@@ -55,9 +55,15 @@ def load_kg_triples():
 
 
 def load_prose():
+    """Return prose memories keyed by drawer_id (string), not chroma's
+    internal integer id. The drawer_id is what KG entities reference, so
+    using it as `id` lets the spiderweb link directly to triples.
+    """
     if not CHROMA_DB.exists():
         return []
     conn = sqlite3.connect(str(CHROMA_DB))
+    # Map chroma's int id -> drawer_id (string).
+    drawer_by_int = {r[0]: r[1] for r in conn.execute("SELECT id, embedding_id FROM embeddings")}
     by_id = {}
     for mid, key, sv, iv, fv, bv in conn.execute(
         "SELECT id, key, string_value, int_value, float_value, bool_value "
@@ -68,11 +74,12 @@ def load_prose():
     conn.close()
     out = []
     for mid, meta in by_id.items():
+        drawer_id = drawer_by_int.get(mid) or f"chid:{mid}"
         doc = meta.get("chroma:document") or ""
-        title = doc.split("\n", 1)[0][:140].strip() or f"(empty memory #{mid})"
+        title = doc.split("\n", 1)[0][:140].strip() or f"(empty memory {drawer_id})"
         out.append({
             "kind": "prose",
-            "id": mid,
+            "id": drawer_id,
             "title": title,
             "doc": doc,
             "wing": meta.get("wing"),
@@ -87,6 +94,69 @@ def load_prose():
             "quarantined": meta.get("quarantined"),
             "confidence": meta.get("confidence"),
         })
+    return out
+
+
+def load_audit_candidates(path):
+    """Read candidates.jsonl (output of palace_crosswing_audit.py) into a
+    map keyed by memory_id: {signal, confidence, evidence, suggested_action}.
+    Multiple signals per memory get combined. Returns {} if file missing.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            mid = row.get("memory_id")
+            if not mid:
+                continue
+            existing = out.setdefault(mid, {
+                "signals": [],
+                "max_confidence": 0.0,
+                "evidence": [],
+                "suggested_action": row.get("suggested_action"),
+            })
+            existing["signals"].append(row.get("signal"))
+            existing["max_confidence"] = max(existing["max_confidence"],
+                                            row.get("confidence", 0.0))
+            existing["evidence"].append({
+                "signal": row.get("signal"),
+                "detail": row.get("evidence"),
+            })
+    return out
+
+
+def load_linked_to():
+    """Return {drawer_id: [linked drawer_ids]} from KG linked_to triples.
+
+    The bidirectional binding writes pairs (A->B and B->A) so this is
+    symmetric in practice. We dedup per-source.
+    """
+    if not KG_DB.exists():
+        return {}
+    conn = sqlite3.connect(str(KG_DB))
+    rows = conn.execute(
+        "SELECT subject, object FROM triples "
+        "WHERE predicate='linked_to' AND invalidated_at IS NULL "
+        "  AND (valid_to IS NULL OR valid_to = '')"
+    ).fetchall()
+    conn.close()
+    # KG entity ids are the lowercased drawer_id (per palace.KnowledgeGraph._eid).
+    # Drawer ids are already lowercase ASCII, so no transformation needed.
+    out = {}
+    for subj, obj in rows:
+        if subj == obj:
+            continue
+        bucket = out.setdefault(subj, [])
+        if obj not in bucket:
+            bucket.append(obj)
     return out
 
 
@@ -121,6 +191,9 @@ HTML = r"""<!doctype html>
   .glyph.retired { background: #c66; }
   .glyph.superseded { background: #cc6; }
   .glyph.quarantined { background: #c8a; }
+  .audit-badge { display: inline-block; padding: 0 4px; margin-left: 6px;
+                 background: #4a3a1a; color: #ffcb6b; border-radius: 2px;
+                 font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; }
   .pred { color: #b88; font-style: italic; }
   .kind-prose .title { color: #ddd; }
   .day-sep { padding: 18px 0 4px; color: #555; font-size: 11px;
@@ -140,6 +213,24 @@ HTML = r"""<!doctype html>
   .detail button.close { position: absolute; top: 8px; right: 8px;
                           background: none; color: #888; border: none;
                           cursor: pointer; font-size: 16px; }
+  .detail .back { background: none; color: #88aaff; border: none;
+                  cursor: pointer; font-size: 11px; padding: 0 4px 8px; }
+  .detail .back:hover { color: #aabbff; }
+  .detail .back:disabled { color: #444; cursor: default; }
+  .detail .crumbs { color: #555; font-size: 10px; padding-bottom: 8px;
+                    border-bottom: 1px solid #333; margin-bottom: 8px;
+                    word-break: break-all; }
+  .detail .links-section { margin-top: 12px; padding-top: 8px;
+                           border-top: 1px solid #333; }
+  .detail .links-section h4 { margin: 0 0 6px; font-size: 11px;
+                              color: #888; font-weight: normal;
+                              text-transform: uppercase; letter-spacing: 0.5px; }
+  .detail .link-item { display: block; padding: 4px 0; font-size: 11px;
+                       color: #88aaff; cursor: pointer;
+                       border-bottom: 1px dotted #333; }
+  .detail .link-item:hover { color: #aaccff; }
+  .detail .link-item .lw { color: #777; font-size: 10px; }
+  .detail .link-item .lt { color: #ccc; }
   .empty { color: #555; padding: 40px; text-align: center; }
   .legend { color: #777; font-size: 11px; margin-left: 12px; }
 </style>
@@ -169,6 +260,16 @@ HTML = r"""<!doctype html>
         <option value="retired">retired/superseded only</option>
       </select>
     </label>
+    <label>audit
+      <select id="f-audit">
+        <option value="">(any)</option>
+        <option value="any">flagged only</option>
+        <option value="wing-named-in-other-wing">wing-named-in-other-wing</option>
+        <option value="wing-orphaned-infra">wing-orphaned-infra</option>
+        <option value="friction-flag">friction-flag</option>
+        <option value="cross-source-behavioral-pattern">cross-source-behavioral-pattern</option>
+      </select>
+    </label>
     <label>search
       <input type="search" id="f-q" placeholder="text, entity, predicate" style="width:200px">
     </label>
@@ -183,10 +284,20 @@ HTML = r"""<!doctype html>
 <main id="main"></main>
 <div class="detail" id="detail">
   <button class="close" onclick="document.getElementById('detail').classList.remove('open')">x</button>
+  <button class="back" id="detail-back" disabled>&larr; back</button>
+  <div class="crumbs" id="detail-crumbs"></div>
   <div id="detail-body"></div>
 </div>
 <script>
 const DATA = __PAYLOAD__;
+const LINKS = __LINKS__;
+// id -> item lookup for O(1) navigation
+const BY_ID = {};
+for (const item of DATA) {
+  if (item.id) BY_ID[item.id] = item;
+}
+// Breadcrumb stack for back-button navigation
+let detailHistory = [];
 
 function fmtDate(d) { if (!d) return ""; return String(d).slice(0, 10); }
 
@@ -238,6 +349,12 @@ function render() {
         : (item.title + " " + (item.doc || ""))).toLowerCase();
       if (!blob.includes(fQ)) return false;
     }
+    const fAudit = document.getElementById("f-audit").value;
+    if (fAudit) {
+      const sigs = item.audit_signals || [];
+      if (fAudit === "any" && !sigs.length) return false;
+      if (fAudit !== "any" && !sigs.includes(fAudit)) return false;
+    }
     return true;
   });
 
@@ -284,10 +401,18 @@ function buildRow(item) {
       '<span>' + esc(item.object) + '</span>' +
       '</div>';
   } else {
+    let audit = "";
+    if (item.audit_signals && item.audit_signals.length) {
+      audit = '<span class="audit-badge" title="' + esc((item.audit_action || "")) + '">' +
+              esc(item.audit_signals[0]) +
+              (item.audit_signals.length > 1 ? " +" + (item.audit_signals.length - 1) : "") +
+              '</span>';
+    }
     body = '<div class="body">' +
       '<span class="glyph ' + cur + '"></span>' +
       '<span class="title">' + esc(item.title) + '</span>' +
       '<span class="pred">  ' + esc((item.hall || "") + "/" + (item.room || "")) + '</span>' +
+      audit +
       '</div>';
   }
   row.innerHTML = dateCell + wingCell + body;
@@ -295,7 +420,7 @@ function buildRow(item) {
   return row;
 }
 
-function showDetail(item) {
+function renderDetailBody(item) {
   const cur = currencyOf(item);
   let html = '<h3>' + item.kind + ' <span class="glyph ' + cur + '"></span>' + cur + '</h3>';
   if (item.kind === "triple") {
@@ -303,26 +428,96 @@ function showDetail(item) {
     html += '<div class="meta-line"><b>predicate:</b> ' + esc(item.predicate) + '</div>';
     html += '<div class="meta-line"><b>object:</b> ' + esc(item.object) + '</div>';
     html += '<div class="meta-line"><b>valid_from:</b> ' + (fmtDate(item.valid_from) || "(undated)") + '</div>';
-    html += '<div class="meta-line"><b>valid_to:</b> ' + (fmtDate(item.valid_to) || "—") + '</div>';
+    html += '<div class="meta-line"><b>valid_to:</b> ' + (fmtDate(item.valid_to) || "&mdash;") + '</div>';
     html += '<div class="meta-line"><b>extracted_at:</b> ' + fmtDate(item.extracted_at) + '</div>';
-    html += '<div class="meta-line"><b>last_verified:</b> ' + (fmtDate(item.last_verified) || "—") + '</div>';
-    html += '<div class="meta-line"><b>invalidated_at:</b> ' + (fmtDate(item.invalidated_at) || "—") + '</div>';
+    html += '<div class="meta-line"><b>last_verified:</b> ' + (fmtDate(item.last_verified) || "&mdash;") + '</div>';
+    html += '<div class="meta-line"><b>invalidated_at:</b> ' + (fmtDate(item.invalidated_at) || "&mdash;") + '</div>';
     html += '<div class="meta-line"><b>confidence:</b> ' + esc(item.confidence) + '</div>';
-    html += '<div class="meta-line"><b>source:</b> ' + (esc(item.source) || "—") + '</div>';
+    html += '<div class="meta-line"><b>source:</b> ' + (esc(item.source) || "&mdash;") + '</div>';
   } else {
     html += '<div class="meta-line"><b>wing/hall/room:</b> ' + esc(item.wing) + '/' + esc(item.hall) + '/' + esc(item.room) + '</div>';
+    html += '<div class="meta-line"><b>id:</b> ' + esc(item.id) + '</div>';
     html += '<div class="meta-line"><b>date:</b> ' + fmtDate(item.date) + '</div>';
     html += '<div class="meta-line"><b>filed_at:</b> ' + fmtDate(item.filed_at) + '</div>';
     if (item.retired_at) {
       html += '<div class="meta-line"><b>retired_at:</b> ' + fmtDate(item.retired_at) + ' (' + esc(item.retired_reason || "") + ')</div>';
-      if (item.superseded_by) html += '<div class="meta-line"><b>superseded_by:</b> ' + esc(item.superseded_by) + '</div>';
+      if (item.superseded_by) {
+        const sb = BY_ID[item.superseded_by];
+        if (sb) {
+          html += '<div class="meta-line"><b>superseded_by:</b> <span class="link-item" data-link-id="' + esc(item.superseded_by) + '">' + esc(sb.title || sb.id) + '</span></div>';
+        } else {
+          html += '<div class="meta-line"><b>superseded_by:</b> ' + esc(item.superseded_by) + '</div>';
+        }
+      }
     }
     html += '<div class="meta-line"><b>confidence:</b> ' + esc(item.confidence) + '</div>';
     html += '<pre>' + esc(item.doc || item.title) + '</pre>';
+
+    // Spiderweb section: clickable neighbors via KG linked_to.
+    const linkedIds = (LINKS[item.id] || []).slice();
+    if (linkedIds.length) {
+      html += '<div class="links-section">';
+      html += '<h4>Linked memories (' + linkedIds.length + ')</h4>';
+      for (const lid of linkedIds) {
+        const target = BY_ID[lid];
+        if (target) {
+          const tw = (target.wing || "?") + "/" + (target.room || "?");
+          const tt = (target.title || target.id || "(no title)").slice(0, 80);
+          html += '<span class="link-item" data-link-id="' + esc(lid) + '">' +
+                  '<span class="lw">' + esc(tw) + '</span> &middot; ' +
+                  '<span class="lt">' + esc(tt) + '</span></span>';
+        } else {
+          html += '<span class="link-item" style="color:#666" title="not in current view">' +
+                  esc(lid) + ' (not loaded)</span>';
+        }
+      }
+      html += '</div>';
+    }
   }
-  document.getElementById("detail-body").innerHTML = html;
-  document.getElementById("detail").classList.add("open");
+  return html;
 }
+
+function showDetail(item, pushHistory = true) {
+  if (!item) return;
+  // History: pushing only when navigating forward (not from back button).
+  if (pushHistory) {
+    const current = detailHistory[detailHistory.length - 1];
+    if (!current || current.id !== item.id) {
+      detailHistory.push(item);
+    }
+  }
+  document.getElementById("detail-body").innerHTML = renderDetailBody(item);
+  renderCrumbs();
+  document.getElementById("detail").classList.add("open");
+
+  // Wire all .link-item[data-link-id] children to navigation.
+  for (const el of document.querySelectorAll("#detail-body .link-item[data-link-id]")) {
+    el.addEventListener("click", () => {
+      const target = BY_ID[el.getAttribute("data-link-id")];
+      if (target) showDetail(target);
+    });
+  }
+}
+
+function renderCrumbs() {
+  const back = document.getElementById("detail-back");
+  back.disabled = detailHistory.length <= 1;
+  const crumbs = document.getElementById("detail-crumbs");
+  if (detailHistory.length <= 1) { crumbs.textContent = ""; return; }
+  const labels = detailHistory.map(it => {
+    if (it.kind === "triple") return (it.predicate || "?") + ":" + (it.object || "?").slice(0, 20);
+    return (it.room || it.title || it.id || "?").slice(0, 30);
+  });
+  crumbs.textContent = labels.join("  >  ");
+}
+
+document.getElementById("detail-back").addEventListener("click", () => {
+  if (detailHistory.length > 1) {
+    detailHistory.pop();
+    const prev = detailHistory[detailHistory.length - 1];
+    showDetail(prev, false);
+  }
+});
 
 (function init() {
   const wings = [...new Set(DATA.map(i => i.wing).filter(Boolean))].sort();
@@ -344,7 +539,7 @@ function showDetail(item) {
     document.getElementById("ax-valid").classList.remove("active");
     render();
   };
-  ["f-wing","f-kind","f-state","f-q"].forEach(id =>
+  ["f-wing","f-kind","f-state","f-q","f-audit"].forEach(id =>
     document.getElementById(id).addEventListener("input", render));
   render();
 })();
@@ -357,16 +552,33 @@ def main():
     ap = argparse.ArgumentParser(description="Bitemporal palace timeline viewer")
     ap.add_argument("--out", default="palace_timeline.html", help="Output HTML path")
     ap.add_argument("--no-open", action="store_true", help="Don't auto-open in browser")
+    ap.add_argument("--audit-jsonl", default="candidates.jsonl",
+                    help="palace_crosswing_audit.py output to overlay (default: candidates.jsonl if present)")
     args = ap.parse_args()
 
     triples = load_kg_triples()
     prose = load_prose()
+    links = load_linked_to()
+    audit = load_audit_candidates(args.audit_jsonl)
+    # Attach audit info to matching prose memories.
+    for p in prose:
+        a = audit.get(p["id"])
+        if a:
+            p["audit_signals"] = a["signals"]
+            p["audit_confidence"] = round(a["max_confidence"], 2)
+            p["audit_action"] = a["suggested_action"]
     payload = triples + prose
+    n_linked = sum(1 for v in links.values() if v)
+    n_audit = sum(1 for p in prose if p.get("audit_signals"))
     print(f"Loaded {len(triples)} triples + {len(prose)} prose memories = {len(payload)} items")
+    print(f"Loaded {len(links)} link buckets ({n_linked} memories with outgoing links)")
+    if audit:
+        print(f"Loaded {len(audit)} audit candidates ({n_audit} prose memories flagged)")
 
     # </script> in any memory text would break the HTML if injected raw.
     payload_json = json.dumps(payload, ensure_ascii=False, default=str).replace("</", "<\\/")
-    html = HTML.replace("__PAYLOAD__", payload_json)
+    links_json = json.dumps(links, ensure_ascii=False).replace("</", "<\\/")
+    html = HTML.replace("__PAYLOAD__", payload_json).replace("__LINKS__", links_json)
 
     out_path = Path(args.out).resolve()
     out_path.write_text(html, encoding="utf-8")
