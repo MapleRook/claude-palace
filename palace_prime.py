@@ -67,6 +67,47 @@ def detect_wing_from_cwd(cwd: str) -> str:
     return name or "unknown"
 
 
+def check_unknown_project(cwd: str, wing: str, get_collection) -> str:
+    """Return a nudge message if cwd has NEITHER a CLAUDE.md NOR any
+    palace memories for its detected wing — otherwise None.
+
+    Why: a project with no CLAUDE.md and no palace wing is a blank slate.
+    Without intervention, every session re-derives everything (the
+    CABINTools-class discovery failure). The global CLAUDE.md says to
+    auto-generate a CLAUDE.md in this case — this nudge surfaces the
+    condition explicitly so the rule actually fires.
+    """
+    if not cwd:
+        return None
+    candidates = [
+        os.path.join(cwd, "CLAUDE.md"),
+        os.path.join(cwd, ".claude", "CLAUDE.md"),
+    ]
+    if any(os.path.exists(c) for c in candidates):
+        return None
+    col = get_collection()
+    if not col:
+        return None
+    try:
+        # Match palace's canonicalization.
+        from palace import canonicalize_wing
+        wing_canon = canonicalize_wing(wing)
+        res = col.get(where={"wing": {"$eq": wing_canon}}, limit=1)
+        if (res.get("ids") or []):
+            return None
+    except Exception:
+        return None
+    return (
+        "## Project Discovery — blank slate detected\n"
+        f"No CLAUDE.md found at `{cwd}` and no palace memories for wing "
+        f"`{wing}`. This project is unknown to your memory system.\n\n"
+        "**Action:** before doing substantive work, either (a) auto-generate "
+        "a project CLAUDE.md after scanning the codebase per the global rule "
+        "(project auto-profiling), or (b) confirm with the user that this dir "
+        "is intentional scratch. Don't proceed silently as if context exists."
+    )
+
+
 def get_recent_git_context(cwd: str) -> str:
     """Get recent git log for additional context."""
     import subprocess
@@ -101,6 +142,11 @@ def run_prime(hook_input: dict):
         return
 
     parts = []
+
+    # Blank-slate nudge: emitted FIRST so it can't be missed.
+    nudge = check_unknown_project(cwd, wing, _get_collection)
+    if nudge:
+        parts.append(nudge)
 
     # L1: Project-specific memories (top 5 most relevant)
     stack = MemoryStack()
